@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "glm-flash-drafter"
+version = "0.1.0"
+description = "Openly trained DFlash2-style speculative-decoding drafter for GLM-5.3-Flash"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "safetensors",
+    "torch>=2.11,<2.13",  # tested on 2.11.0; 2.13 breaks compiled flex attention on CPU
+    "transformers>=4.56",
+    # Also required: vllm-project/speculators (Apache-2.0) at 824125a36600b5af8fdd1b18286da51ed60f60a8, the
+    # revision every result in docs/results.md was produced with.  It cannot be listed here as a git URL (its
+    # source build points hs-connectors at a path pip deletes); install it with scripts/install_speculators.sh.
+]
+
+[project.optional-dependencies]
+# chat-template rendering and token counts (scripts/prepare_items.py, prompt token counts); transformers is a core dep
+tokenize = ["tokenizers", "jinja2"]
+# structured-coverage validators (enntity_drafter.prompts.validate, used by scripts/prepare_items.py)
+validate = ["pyyaml"]
+test = ["pytest"]
+
+[tool.setuptools]
+packages = ["enntity_drafter", "enntity_drafter.prompts"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

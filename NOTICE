@@ -1,0 +1,42 @@
+glm-flash-drafter
+Copyright 2026 Enntity
+
+This project is licensed under the MIT License (see LICENSE). Portions of
+enntity_drafter/fastpath.py and enntity_drafter/objectives.py are derived from
+vllm-project/speculators and remain under the Apache License, Version 2.0
+(see LICENSES/Apache-2.0.txt).
+
+Third-party software and models used by this project
+-----------------------------------------------------
+
+vllm-project/speculators (https://github.com/vllm-project/speculators)
+  Apache License 2.0. Installed as a dependency at revision
+  824125a36600b5af8fdd1b18286da51ed60f60a8 (scripts/install_speculators.sh); not
+  vendored. Provides DFlash2DraftModel, the DFlash/DFlash2 losses, metrics and
+  attention masks this trainer builds on. Its DFlash2 model definitions carry
+  the notice "MIT License, Copyright (c) 2026 Z Lab" (from
+  https://github.com/z-lab/dflash).
+
+enntity_drafter/fastpath.py and enntity_drafter/objectives.py re-implement
+  (packed attention mask) or re-compose (light loss path) upstream Speculators
+  functions; their behaviour is tested against the upstream functions.
+
+GLM-5.3-Flash (https://huggingface.co/zai-org/GLM-5.3-Flash) and
+nvidia/GLM-5.3-Flash-NVFP4 (https://huggingface.co/nvidia/GLM-5.3-Flash-NVFP4)
+  MIT License. The target model. Its embedding, final norm and lm_head are
+  read at training time from the user's own copy and are never exported or
+  redistributed; its tokenizer and chat template are read from that copy.
+
+Atlas inference engine (https://github.com/Enntity/atlas)
+  AGPL-3.0-only. Used as a separate server for hidden-state capture and
+  evaluation; no engine code is included here.
+
+RigMark (https://github.com/alexellis/rigmark)
+  MIT License. Benchmark used for some results in docs/results.md; not included.
+
+Not used
+--------
+
+incoai/GLM-5.3-Flash-DFlash2 (CC BY-NC-ND 4.0): no weights, configuration,
+tokenizer files, outputs or text from it are used or included. Comparisons in
+docs/results.md are measurements of that drafter served by Atlas.
