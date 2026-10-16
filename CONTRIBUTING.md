@@ -5,8 +5,8 @@ license, so the rules on data and weights are strict.
 
 ## Before you open a pull request
 
-- **License.** Contributions are accepted under the MIT License (the
-  repository license). By opening a pull request you confirm you have the right to
+- **License.** Contributions are accepted under Apache-2.0 (the repository
+  license). By opening a pull request you confirm you have the right to
   contribute the code or text under it.
 - **No restricted weights or data.** Do not add, link as a training input, or
   derive anything from `incoai/GLM-5.3-Flash-DFlash2` or other non-commercial /

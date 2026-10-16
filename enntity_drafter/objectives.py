@@ -1,5 +1,5 @@
-# SPDX-License-Identifier: MIT AND Apache-2.0
-# Portions are derived from vllm-project/speculators (Apache-2.0, LICENSES/Apache-2.0.txt); see NOTICE.
+# SPDX-License-Identifier: Apache-2.0
+# Portions are derived from vllm-project/speculators (Apache-2.0); see NOTICE.
 """Training objectives for the scratch drafter.
 
 ``upstream``

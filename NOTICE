@@ -1,10 +1,9 @@
 glm-flash-drafter
 Copyright 2026 Enntity
 
-This project is licensed under the MIT License (see LICENSE). Portions of
-enntity_drafter/fastpath.py and enntity_drafter/objectives.py are derived from
-vllm-project/speculators and remain under the Apache License, Version 2.0
-(see LICENSES/Apache-2.0.txt).
+This project is licensed under the Apache License, Version 2.0 (see LICENSE).
+Portions of enntity_drafter/fastpath.py and enntity_drafter/objectives.py are
+derived from vllm-project/speculators (Apache-2.0).
 
 Third-party software and models used by this project
 -----------------------------------------------------

@@ -1,5 +1,5 @@
-# SPDX-License-Identifier: MIT AND Apache-2.0
-# Portions are derived from vllm-project/speculators (Apache-2.0, LICENSES/Apache-2.0.txt); see NOTICE.
+# SPDX-License-Identifier: Apache-2.0
+# Portions are derived from vllm-project/speculators (Apache-2.0); see NOTICE.
 """Round-2 performance path for the scratch drafter trainer (every piece is opt-in).
 
 Round 1 spent ~76% of a micro-step outside GEMMs (docs/training.md): per-micro fp32->bf16

@@ -30,11 +30,10 @@ safetensors metadata and known hashes).
 
 ## License
 
-**MIT** ([LICENSE](LICENSE), [NOTICE](NOTICE)), matching the target model's own
-license. The few functions re-implemented from
-[vllm-project/speculators](https://github.com/vllm-project/speculators) keep its
-Apache-2.0 terms ([LICENSES/Apache-2.0.txt](LICENSES/Apache-2.0.txt)); speculators
-itself is installed as a dependency, not vendored. The target,
+**Apache-2.0** ([LICENSE](LICENSE), [NOTICE](NOTICE)), the same license as
+[vllm-project/speculators](https://github.com/vllm-project/speculators), which the
+trainer builds on, so the whole training stack has one set of terms and an
+explicit patent grant. The target,
 GLM-5.3-Flash, is MIT, which permits this use; no target file is redistributed
 (the trainer and Atlas read the embedding and lm_head from your own copy).
 Teacher text from hosted endpoints is also subject to each host's terms (see
