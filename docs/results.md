@@ -13,7 +13,7 @@ arm gave identical tok/step. Rounds 1-2b are single training runs.
 |---|---|---|---|---|
 | 1 | template prompts (Enntity-authored) + Enntity-internal agentic and chat traffic | 7,547 | 20.2M | 22.6M |
 | 2a | round 1 rows, source-balanced (template 35%, internal sources 65%) | same | same | +46.3M (continued from round 1) |
-| 2b | round 1 rows + 23,942 structured-coverage rows (FP8), small sources capped at 2 epochs | 31,489 | 43.6M | +60.8M so far (continued from 2a) |
+| 2b | round 1 rows + 23,942 structured-coverage rows (FP8), small sources capped at 2 epochs | 31,489 | 43.6M | +114.1M (continued from 2a) |
 
 Template rows were 92% of round 1's anchors. The internal sources are not
 published; see the README for what that means for reproduction.
@@ -99,7 +99,7 @@ curve flattened). Conditional acceptance by depth at the end: .75 .69 .69 .73
 memorized (held-out loss stopped improving after ~step 1,300), which is why
 round 2b caps epochs and adds new data.
 
-### Round 2b (from round 2a, running; numbers as of step 2,464 of 4,620)
+### Round 2b (from round 2a; 4,620 steps, 114.1M supervised tokens)
 
 | step | supervised tokens (M) | agentic eal | template eal | structured eal | structured oracle |
 |---|---|---|---|---|---|
@@ -112,12 +112,19 @@ round 2b caps epochs and adds new data.
 | 1848 | 45.6 | 3.401 | 2.821 | 5.015 | 6.467 |
 | 2156 | 53.2 | 3.388 | 2.874 | 5.127 | 6.551 |
 | 2464 | 60.8 | 3.431 | 2.945 | 5.207 | 6.623 |
+| 4620 (end) | 114.1 | 3.507 | 3.141 | 5.551 | 6.882 |
 
-At step 2,464, template by category: code 3.18, prose 2.21, structured 3.55
+At the end, template by category: code 3.40, prose 2.34, structured 3.82
 (at step 0: 2.89, 2.05, 3.03). The template group's prompts were partly seen
 by the parent rounds (about a quarter of their anchor positions), so its
-step-0 value is optimistic; round 2b never trains on them. Not yet measured
-in Atlas.
+step-0 value is optimistic; round 2b never trains on them.
+
+Atlas tok/step (shipped adaptive verify width): matched prose 1.905, matched
+code 3.574, RigMark structured 4.944 (0.76x, 0.73x and 0.65x of DFlash2);
+RigMark structured decode rose from 43 to 71 tok/s. A fixed verify width of 7
+raised tok/step 5-18% but lowered decode speed 3-34%, so the adaptive policy
+is the right one for this drafter. Prose survival by draft depth is
+.60 .27 .09 .03: the remaining prose gap is real, not a width artefact.
 
 ## Throughput
 

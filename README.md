@@ -53,31 +53,33 @@ Atlas accepted tokens per verify step (higher is better; greedy, one request
 at a time, same server and settings for every drafter; both visits per arm
 gave identical tok/step):
 
-| category | DFlash2 (incoai) | round 1 | round 2a |
-|---|---|---|---|
-| matched prose, 12 prompts x 256 tokens | 2.501 | 1.589 | 1.785 |
-| matched code, 12 prompts x 256 tokens | 4.890 | 2.471 | 2.863 |
-| RigMark code | 4.347 | 2.134 | 2.537 |
-| RigMark prose | 2.044 | 1.404 | 1.573 |
-| RigMark structured | 7.569 | 2.081 | 2.412 |
+| category | DFlash2 (incoai) | round 1 | round 2a | round 2b |
+|---|---|---|---|---|
+| matched prose, 12 prompts x 256 tokens | 2.501 | 1.589 | 1.785 | 1.905 |
+| matched code, 12 prompts x 256 tokens | 4.890 | 2.471 | 2.863 | 3.574 |
+| RigMark code | 4.347 | 2.134 | 2.537 | not measured |
+| RigMark prose | 2.044 | 1.404 | 1.573 | not measured |
+| RigMark structured | 7.569 | 2.081 | 2.412 | 4.944 |
 
 Output text was identical across all drafters on every matched prompt.
-Round 2a reaches 0.58-0.77x of DFlash2's tok/step on these rows (0.32x on
-structured output); it is not yet a replacement.
+Round 2b reaches 0.73-0.76x of DFlash2's tok/step on matched prose and code
+and 0.65x on RigMark structured output (up from 0.32x in round 2a; decode on
+that row rose from 43 to 71 tok/s). It is not yet a replacement.
 
-Round 2b (running as of 2026-10-16) adds 23,942 rows of structured-output data
-(JSON, tool calls, configs, code edits, tables) and held-out groups for it. On
-the trainer's teacher-forced proxy (expected accepted length per block, 1-8),
-at step 2,464 of 4,620:
+Round 2b added 23,942 rows of structured-output data (JSON, tool calls,
+configs, code edits, tables) and capped every source at 2 epochs. On the
+trainer's teacher-forced proxy (expected accepted length per block, 1-8):
 
-| held-out group | start (round 2a weights) | step 2,464 |
+| held-out group | start (round 2a weights) | end of round 2b |
 |---|---|---|
-| structured (coverage prompts) | 2.75 | 5.21 |
-| template (code, prose, structured, tools) | 2.65 | 2.95 |
-| agentic (internal sessions) | 3.36 | 3.43 |
+| structured (coverage prompts) | 2.75 | 5.55 |
+| template (code, prose, structured, tools) | 2.65 | 3.14 |
+| prose | 2.05 | 2.34 |
+| agentic (internal sessions) | 3.36 | 3.51 |
 
-These are proxy numbers, not Atlas measurements; round 2b has not been checked
-in the engine yet. Details, curves and caveats: [docs/results.md](docs/results.md).
+Prose acceptance still falls off quickly with draft depth, so round 3 adds
+prose and code coverage data. Details, curves and caveats:
+[docs/results.md](docs/results.md).
 
 ## Pipeline
 
