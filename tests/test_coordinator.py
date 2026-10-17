@@ -392,6 +392,39 @@ class CoordinatorTests(unittest.TestCase):
         for page in ("/how", "/join", "/static/app.js", "/static/style.css"):
             self.assertEqual(urllib.request.urlopen(self.net.base + page).status, 200, page)
 
+    def test_status_ages_out_and_self_check_failures_reach_attention(self):   # dogfood: "training" for 13 min
+        site, quiet, done = self.net.register("Lab two"), self.net.register("Lab three"), self.net.register("Lab four")
+        req = site.call("GET", "/api/v1/requirements")
+        self.assertIn("check_failed", req["heartbeat_fields"])   # the client sends optional fields only if listed
+        self.assertIn("stopped", req["phases"])
+        with self.assertRaises(ApiError) as refused:   # codes only, from the known set: no free text
+            site.call("POST", "/api/v1/heartbeat", {"phase": "error", "check_failed": 1, "check_code": "my-host"})
+        self.assertEqual(refused.exception.status, 400)
+        site.call("POST", "/api/v1/heartbeat", {"phase": "error", "check_failed": 2, "check_code": "heldout_regression",
+                                                "check_canary": 1, "check_drop": 0.082})
+        quiet.call("POST", "/api/v1/heartbeat", {"phase": "training", "tokens": 1.0})
+        done.call("POST", "/api/v1/heartbeat", {"phase": "stopped"})
+
+        def status() -> dict:
+            data = json.loads(urllib.request.urlopen(self.net.base + "/api/public/dashboard").read())
+            return {s["name"]: s["status"] for s in data["sites"]}
+
+        self.assertEqual({k: v for k, v in status().items() if k != "anonymous"},
+                         {"Lab two": "error", "Lab three": "training", "Lab four": "stopped"})
+        attention = self.net.admin_call("GET", "/admin/attention")
+        self.assertEqual([c["text"] for c in attention["self_check_failures"]],
+                         ["site Lab two: canary self-check failed: heldout_regression x2"])
+        self.assertEqual(attention["self_check_failures"][0]["drop"], 0.082)
+        self.assertEqual(attention["silent_sites"], [])
+        self.net.clock.t += 2 * self.net.config.heartbeat_s + 1   # two missed heartbeats
+        self.assertEqual(status()["Lab three"], "stale")
+        self.assertEqual([(s["name"], s["status"]) for s in self.net.admin_call("GET", "/admin/attention")
+                          ["silent_sites"]], [("Lab two", "stale"), ("Lab three", "stale")])   # not the stopped one
+        self.net.clock.t += self.net.config.online_s
+        self.assertEqual(set(status().values()), {"offline"})
+        self.assertEqual({s["status"] for s in self.net.admin_call("GET", "/admin/attention")["silent_sites"]},
+                         {"offline"})
+
     def test_state_survives_restart(self):
         site = self.net.register("ivy")
         reply = site.call("POST", "/api/v1/deltas", delta_body(site, self.blob, 0, self.v0, "client-restart"))
@@ -458,9 +491,10 @@ class ReviewRegressionTests(unittest.TestCase):
         self.net.admin_call("POST", "/admin/settings/training", {"value": {}})   # the dogfood network's value
         refused(["training"])
         self.net.admin_call("POST", "/admin/settings/training", {"value": {"lr": 1e-4, "warmup": 50}})
-        refused(["training.min_lr_ratio", "training.anchors", "training.grad_accum", "training.inner_steps"])
-        self.net.admin_call("POST", "/admin/settings/training", {"value": {
-            "lr": 1e-4, "warmup": 50, "min_lr_ratio": 0.3, "anchors": 512, "grad_accum": 4, "inner_steps": 250}})
+        refused(["training.min_lr_ratio", "training.anchors", "training.global_anchors|grad_accum",
+                 "training.inner_steps"])
+        self.net.admin_call("POST", "/admin/settings/training", {"value": {   # a global batch, or (before) grad_accum
+            "lr": 1e-4, "warmup": 50, "min_lr_ratio": 0.3, "anchors": 512, "global_anchors": 2048, "inner_steps": 250}})
         self.assertEqual(self.net.admin_call("GET", "/admin/attention")["missing_settings"], [])
         self.assertIn("#invite=", self.net.admin_call("POST", "/admin/invites", {})["url"])
         self.assertEqual(site.call("POST", "/api/v1/shards/claim")["shard"]["id"], "s000000")

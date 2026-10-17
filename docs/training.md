@@ -57,8 +57,9 @@ goes to data and capacity, not to the selector objective.
 ## Data path
 
 - `--capture-index` + `--capture-root`: Atlas captures read in place
-  (`enntity_drafter.capture_io`). A sample is one row: up to `--anchors` (512)
-  anchors drawn inside a random crop of `--crop` (4096) eligible positions, and
+  (`enntity_drafter.capture_io`). A sample is one row: up to `--anchors`
+  anchors (the micro-batch; default 64, round 2b used 512, volunteer sites take
+  it from the network's `training` settings and the probe) drawn inside a random crop of `--crop` (4096) eligible positions, and
   the union of their windows `[a - 2048, a + 8)` read with `np.memmap`.
   Disjoint windows become separate documents in one packed sequence, with
   absolute `position_ids`. Anchors without the full window are skipped, never
@@ -106,8 +107,15 @@ stream. `--init-from` starts a new run from one of this trainer's checkpoints
 (stamped provenance and matching config required; fresh optimizer).
 
 GB10 memory is shared by CPU and GPU; exhaustion can hang the host.
-`--probe` runs a worst-case-size forward/backward before step 0 and counts the
-not-yet-allocated optimizer state against `--min-free-gb`; `--min-free-gb`
+`--probe` runs a worst-case-size forward/backward at every start and resume
+(memory used by other services changes meanwhile) and counts the
+not-yet-allocated optimizer state against `--min-free-gb` plus
+`--probe-headroom-gb`. With `--global-anchors N` (anchors per optimizer step
+over the run's ranks) the probe also sizes the micro-batch: it tries the
+largest `--anchors` first and smaller splits of N after it, then sets
+`--grad-accum` so micro x accum x ranks = N, logged as a `batch` record; a
+resumed run tries its checkpoint's micro-batch first, so the stream replays
+exactly while memory allows. `--min-free-gb`
 stops every rank cleanly when host MemAvailable falls below it;
 `--max-mem-fraction` caps the CUDA allocator; an OOM exits the rank at once.
 `--time-budget-h` plans the step count from smoke-step timings

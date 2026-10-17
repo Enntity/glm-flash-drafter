@@ -45,7 +45,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from . import model as sm  # first: sets the torch.compile / HF offline defaults
 
@@ -384,6 +384,90 @@ def worst_case_probe(model: nn.Module, args: argparse.Namespace, cfg: dict[str, 
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     return {"probe_rows": rows, "probe_anchors": len(anchors), "probe_s": round(time.monotonic() - started, 3)}
+
+
+MIN_MICRO_ANCHORS = 8   # smallest micro-batch --global-anchors may pick
+
+
+def batch_candidates(anchors: int, grad_accum: int, global_anchors: int | None, ranks: int
+                     ) -> list[tuple[int, int]]:
+    """(micro-batch anchors, grad_accum) pairs to try, the largest micro-batch first.  Without ``global_anchors``
+    the given pair; with it, every split of ``global_anchors / ranks`` into micro x accum with a micro-batch of
+    ``MIN_MICRO_ANCHORS``..``anchors`` (``anchors`` is an upper bound, never forced)."""
+
+    if not global_anchors:
+        return [(anchors, grad_accum)]
+    per_rank, left = divmod(global_anchors, ranks)
+    pairs = [(per_rank // accum, accum) for accum in range(1, per_rank + 1)
+             if not left and per_rank % accum == 0 and MIN_MICRO_ANCHORS <= per_rank // accum <= anchors]
+    if not pairs:
+        raise SystemExit(f"--global-anchors {global_anchors} over {ranks} rank(s) has no micro-batch of "
+                         f"{MIN_MICRO_ANCHORS}..{anchors} anchors that divides it")
+    return pairs
+
+
+def choose_batch(candidates: list[tuple[int, int]], probe: Callable[[int], tuple[bool, dict[str, Any]]] | None
+                 ) -> tuple[tuple[int, int] | None, list[dict[str, Any]]]:
+    """The first (largest) candidate whose probe fits, and every probe record; ``probe`` None: the first, untried.
+    (None, records) when nothing fits."""
+
+    if probe is None:
+        return candidates[0], []
+    records = []
+    for anchors, accum in candidates:
+        fits, record = probe(anchors)
+        records.append({**record, "fits": fits})
+        if fits:
+            return (anchors, accum), records
+    return None, records
+
+
+def select_batch(args: argparse.Namespace, resumed: dict[str, Any], model: nn.Module, cfg: dict[str, Any],
+                 device: torch.device, dtype: torch.dtype, kwargs: dict[str, Any], selector_prefix: dict[str, Any],
+                 optimizer: torch.optim.Optimizer, world: int, emit, step: int) -> None:
+    """Set ``args.anchors`` and ``args.grad_accum``: :func:`batch_candidates`, each checked by a worst-case probe
+    (``--probe``, run at every start and resume: memory shared with other services changes) that must leave
+    ``--min-free-gb`` + ``--probe-headroom-gb`` free.  A resumed run first tries its checkpoint's micro-batch (the
+    stream then replays exactly), smaller ones only if that no longer fits."""
+
+    candidates = batch_candidates(args.anchors, args.grad_accum, args.global_anchors, world)
+    if resumed.get("anchors") and args.global_anchors:
+        candidates = [c for c in candidates if c[0] <= int(resumed["anchors"])] or candidates[-1:]
+
+    def probe(anchors: int) -> tuple[bool, dict[str, Any]]:
+        args.anchors = anchors
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()   # a larger probe's cached blocks would count against this one
+        try:
+            record, oom = worst_case_probe(model, args, cfg, device, dtype, args.objective, kwargs, selector_prefix), 0
+        except torch.OutOfMemoryError as error:
+            record, oom = {"probe_error": str(error)[:300]}, 1
+        optimizer.zero_grad(set_to_none=True)  # fp32 master gradients of the probe
+        if oom and device.type == "cuda":
+            gc.collect()
+            torch.cuda.empty_cache()
+        free, peak = memory_consensus(device, world)
+        flag = torch.tensor([float(oom)], device=device)
+        if world > 1:   # every rank takes the same decision
+            dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+        # AdamW state (2 fp32 tensors per parameter) is allocated at the first
+        # optimizer step, after the probe: count it against the margin now.
+        pending = 0.0 if optimizer.state else 2 * sum(p.numel() * 4 for _, p in trainable(model)) / 1e9
+        record.update(anchors=anchors, probe_peak_mem_gb=round(peak, 2), probe_min_mem_available_gb=round(free, 2),
+                      probe_pending_optimizer_gb=round(pending, 2))
+        return not flag.item() and free - pending >= args.min_free_gb + args.probe_headroom_gb, record
+
+    chosen, records = choose_batch(candidates, probe if args.probe else None)
+    for record in records:
+        emit({"phase": "probe", "step": step, **record})
+    if chosen is None:
+        abort_run(emit, {"reason": "probe_low_memory", "step": step, **records[-1]}, world)
+    args.anchors, args.grad_accum = chosen
+    if args.global_anchors or resumed.get("anchors") not in (None, args.anchors):
+        emit({"phase": "batch", "step": step, "global_anchors": args.anchors * args.grad_accum * world,
+              "anchors": args.anchors, "grad_accum": args.grad_accum, "ranks": world,
+              "resumed_anchors": resumed.get("anchors"), "probed": [r["anchors"] for r in records]})
 
 
 def plan_steps(args: argparse.Namespace, step_times: list[float], eval_s: float, run_started: float,
@@ -886,7 +970,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="micro-steps per optimizer step; gradients are all-reduced once, after the last")
     p.add_argument("--grad-reduce-dtype", choices=["bf16", "fp32"], default="bf16",
                    help="wire dtype of the gradient all-reduce (accumulation and optimizer stay fp32)")
-    p.add_argument("--anchors", type=int, default=64, help="anchor blocks per row per micro-step")
+    p.add_argument("--anchors", type=int, default=64, help="anchor blocks per row per micro-step (with "
+                   "--global-anchors: the largest micro-batch to try)")
+    p.add_argument("--global-anchors", type=int, default=None,
+                   help="anchor blocks per optimizer step over this run's ranks: the micro-batch (--anchors) and "
+                        "--grad-accum are derived so micro x accum x ranks equals it, the micro-batch as large as "
+                        "--probe finds memory for (choose_batch)")
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--min-lr-ratio", type=float, default=0.1)
     p.add_argument("--warmup", type=int, default=2000)
@@ -916,6 +1005,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="before step 0: one worst-case-size forward/backward (synthetic), memory checked")
     p.add_argument("--min-free-gb", type=float, default=0.0,
                    help="abort cleanly (exit 3) when any rank's host MemAvailable falls below this")
+    p.add_argument("--probe-headroom-gb", type=float, default=0.0,
+                   help="--probe: the micro-batch must leave this much above --min-free-gb (memory shared with "
+                        "other services moves)")
     p.add_argument("--max-mem-fraction", type=float, default=None,
                    help="CUDA caching-allocator cap (fraction of device memory): OOM raises instead of "
                         "exhausting unified memory")
@@ -1099,6 +1191,10 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     kwargs = loss_kwargs(device.type, args.unary_loss, args.per_position, args.gamma,
                          args.selector_alpha, args.dpace_alpha)
     selector_prefix = {"floor": args.prefix_floor, "eal_weight": args.eal_weight}
+    if not args.eval_only:   # before the stream: its items depend on the micro-batch
+        select_batch(args, counters if start_step else {}, model, cfg, device, compute_dtype, kwargs,
+                     selector_prefix, optimizer, world, emit, start_step)
+    items_start = int(counters.get("items_done", start_step * args.grad_accum))   # micro-steps consumed per rank
     if capture is not None:
         if not args.eval_only:
             stream = cd.CaptureTrainStream(args.capture_index, args.capture_root, rank=data_rank, world=data_world,
@@ -1163,24 +1259,6 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         if args.eval_every:
             emit({"phase": "eval", "step": 0, "tokens_seen": 0, **run_eval()})
         eval_s = time.monotonic() - eval_started
-        if args.probe:
-            try:
-                probe = worst_case_probe(model, args, cfg, device, compute_dtype, args.objective, kwargs,
-                                         selector_prefix)
-            except torch.OutOfMemoryError as error:
-                emit_local(rank, output, {"phase": "abort", "reason": "probe_oom", "error": str(error)[:500]})
-                os._exit(3)
-            optimizer.zero_grad(set_to_none=True)  # fp32 master gradients of the probe
-            free, peak = memory_consensus(device, world)
-            # AdamW state (2 fp32 tensors per parameter) is allocated at the first
-            # optimizer step, after the probe: count it against the margin now.
-            pending = (0.0 if optimizer.state
-                       else 2 * sum(p.numel() * 4 for _, p in trainable(model)) / 1e9)
-            probe.update(probe_peak_mem_gb=round(peak, 2), probe_min_mem_available_gb=round(free, 2),
-                         probe_pending_optimizer_gb=round(pending, 2))
-            emit({"phase": "probe", **probe})
-            if free - pending < args.min_free_gb:
-                abort_run(emit, {"reason": "probe_low_memory", "step": 0, **probe}, world)
     else:
         eval_s = float(counters.get("eval_s", 0.0))
         emit({"phase": "resume", "step": start_step})
@@ -1202,7 +1280,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     samples = None
     loader_stats: dict[str, float] = {}
     if capture is not None:
-        samples = iter(cd.train_loader(stream, start_step * args.grad_accum, 1 << 40, args.loader_workers,
+        samples = iter(cd.train_loader(stream, items_start, 1 << 40, args.loader_workers,
                                        pin_memory=device.type == "cuda", mode=args.loader_mode,
                                        pin_threads=args.pin_loader and device.type == "cuda", stats=loader_stats))
     host = fp.HostStats(device)
@@ -1240,7 +1318,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         deferred: dict[str, torch.Tensor] = {}   # --deferred-metrics: device-side sums
         step_rows: list[str] = []
         for micro in range(args.grad_accum):
-            global_index = (step * args.grad_accum + micro) * data_world + data_rank
+            global_index = (items_start + (step - start_step) * args.grad_accum + micro) * data_world + data_rank
             if samples is not None:
                 waited = time.monotonic()
                 sample = next(samples)
@@ -1478,7 +1556,9 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
             round_start_tokens = tokens_seen
         if completed % args.checkpoint_every == 0 or completed == args.steps or (round_end and external):
             save_checkpoint(output, completed, model, optimizer, rank, world, provenance,
-                            {"tokens_seen": tokens_seen, "eval_s": eval_s,
+                            {"tokens_seen": tokens_seen, "eval_s": eval_s, "anchors": args.anchors,
+                             "grad_accum": args.grad_accum,
+                             "items_done": items_start + (completed - start_step) * args.grad_accum,
                              **({"round_start_tokens": round_start_tokens} if diloco is not None else {}),
                              **({"planned_steps": args.steps} if args.time_budget_h is not None else {}),
                              **({"cap_switch_item": cap_switch} if cap_switch is not None else {})}, owned,

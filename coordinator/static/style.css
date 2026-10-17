@@ -42,6 +42,7 @@ td.num, th.num { text-align: right; }
 .status { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 0.8rem; border: 1px solid var(--line); }
 .status.on { color: var(--good); border-color: var(--good); }
 .status.off { color: var(--muted); }
+.status.warn { color: var(--warn); border-color: var(--warn); }
 .anon { color: var(--muted); font-style: italic; }
 .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
 .grid2 section { margin: 0; }

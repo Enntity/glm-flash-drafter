@@ -392,8 +392,9 @@ class ClientTests(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
         req = {"norm_bounds": {"max_abs": 10.0, "max_rms": 1e-3, "min_rms": 1e-5}}
+        quiet = type("Quiet", (), {"call": lambda self, *a, **k: {}})()   # heartbeats go nowhere
         with tempfile.TemporaryDirectory() as tmp:
-            site = self.site(tmp, None)
+            site = self.site(tmp, quiet)
             for canary, candidate, failure in ((True, 4.59, None), (False, 4.59, "heldout_regression"),
                                                (True, 2.0, "canary_collapse")):
                 cycle = {"client_id": "c1", "canary": canary, "data": [],
@@ -422,7 +423,7 @@ class ClientTests(unittest.TestCase):
 
             site = self.site(tmp, Fake())
             for value, missing in (({}, "training"), ({"lr": 1e-4, "warmup": 50, "anchors": 512},
-                                                      "training.min_lr_ratio, training.grad_accum, "
+                                                      "training.min_lr_ratio, training.global_anchors|grad_accum, "
                                                       "training.inner_steps")):
                 training.clear()
                 training.update(value)
@@ -434,6 +435,125 @@ class ClientTests(unittest.TestCase):
             self.assertEqual({m for m, _ in calls}, {"GET"})   # nothing claimed, uploaded or trained
             with self.assertRaises(join.JoinError):   # a resumed cycle cannot reach the trainer either
                 site._trainer({"client_id": "c2", "canary": False, "data": []}, {"training": {"lr": 1e-4}})
+
+    def test_global_batch_probe_guards_and_override_warning(self):   # dogfood: anchors 512 on a shared GB10
+        import contextlib
+        import io
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            site = self.site(tmp, None)
+            site.opts.trainer_arg = ["--anchors=256", "--min-free-gb=8"]   # the JOIN troubleshooting escape hatch
+            launched = []
+
+            class Done:
+                returncode = 1
+
+                def __init__(self, argv, **kwargs):
+                    launched.append(argv)
+
+                def poll(self):
+                    return 1
+
+            training = {"lr": 1e-4, "warmup": 50, "min_lr_ratio": 0.3, "anchors": 512, "global_anchors": 2048,
+                        "grad_accum": 4, "inner_steps": 10}
+            out = io.StringIO()
+            with mock.patch.object(join.subprocess, "Popen", Done), mock.patch("torch.cuda.is_available",
+                                                                                 return_value=True), \
+                    contextlib.redirect_stdout(out):
+                for _ in range(2):
+                    with self.assertRaises(join.JoinError):
+                        site._trainer({"client_id": "c3", "canary": False, "data": [], "base": {"path": "b"}},
+                                      {"training": training})
+            argv = launched[0]
+            self.assertEqual(argv[argv.index("--global-anchors") + 1], "2048")
+            self.assertEqual(argv[argv.index("--anchors") + 1], "512")   # the network's cap ...
+            self.assertNotIn("--grad-accum", argv)                       # ... and the trainer derives grad_accum
+            self.assertLess(argv.index("--anchors"), argv.index("--anchors=256"))   # the local flag wins
+            self.assertIn("--probe", argv)   # on every start and resume, whatever local guards are given
+            self.assertEqual(argv[argv.index("--probe-headroom-gb") + 1], "4")
+            self.assertEqual([a for a in argv if a.startswith("--min-free-gb")], ["--min-free-gb=8"])
+            warnings = [l for l in out.getvalue().splitlines() if "overrides the network" in l]
+            self.assertEqual(len(warnings), 1)   # once per flag
+            self.assertIn("--anchors overrides the network's setting --anchors 512", warnings[0])
+            log = Path(tmp) / "train.jsonl"   # the trainer's choice is reported
+            log.write_text(json.dumps({"phase": "batch", "anchors": 256, "grad_accum": 8, "ranks": 1,
+                                       "global_anchors": 2048, "probed": [256]}) + "\n")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                site._progress(log, 10)
+                site._progress(log, 10)
+            self.assertEqual(out.getvalue().count("micro-batch: 256 anchors x grad_accum 8 x 1 rank(s) = 2048"), 1)
+
+    def test_failed_self_checks_and_stops_are_reported_in_heartbeats(self):   # dogfood: invisible to the operator
+        from unittest import mock
+
+        from enntity_drafter import validation
+
+        beats, scores = [], []
+
+        class Fake:
+            def call(self, method, path, body=None, auth=True):
+                beats.append(body)
+                return {"ok": True}
+
+        for patch in (mock.patch.object(validation, "check_delta", lambda *a: {"meta": {}}),
+                      mock.patch.object(validation, "candidate_weights", lambda *a: None),
+                      mock.patch.object(validation, "evaluate", lambda *a, **k: {}),
+                      mock.patch.object(validation, "metrics_of", lambda record: scores.pop(0))):
+            patch.start()
+            self.addCleanup(patch.stop)
+        with tempfile.TemporaryDirectory() as tmp:
+            site = self.site(tmp, Fake())
+            cycle = {"client_id": "c1", "canary": True, "data": [],
+                     "base": {"path": str(Path(tmp) / "base.safetensors"), "sha256": "0" * 64}}
+            site.heartbeat_fields = ["check_failed", "check_code", "check_canary", "check_drop"]
+            for _ in range(2):
+                scores[:] = [{"heldout": 5.0}, {"heldout": 1.0}]
+                with self.assertRaises(join.JoinError):
+                    site._self_check(dict(cycle), Path(tmp) / "d.safetensors", {})
+            self.assertEqual([(b["phase"], b["check_failed"], b["check_code"], b["check_canary"]) for b in beats],
+                             [("error", 1, "canary_collapse", 1), ("error", 2, "canary_collapse", 1)])
+            self.assertAlmostEqual(beats[-1]["check_drop"], 0.8)
+            self.assertEqual(json.loads((Path(tmp) / "state.json").read_text())["self_check"]["failed"], 2)
+            site.heartbeat_fields = []   # an older coordinator refuses unknown fields: not sent
+            site.heartbeat()
+            self.assertNotIn("check_failed", beats[-1])
+            scores[:] = [{"heldout": 5.0}, {"heldout": 5.0}]
+            site._self_check(dict(cycle), Path(tmp) / "d.safetensors", {})   # passing clears it
+            self.assertNotIn("self_check", site.state)
+            for phases, phase in ((["idle", "stopped"], "stopped"), ([], "idle")):   # [] : an older coordinator
+                site.phases = phases
+                site.stopped()
+                self.assertEqual(beats[-1]["phase"], phase)
+
+    def test_stopping_the_client_stops_the_trainer(self):   # dogfood: no orphaned trainer, no stale "training"
+        from unittest import mock
+
+        events = []
+
+        class Running:
+            returncode = None
+
+            def __init__(self, argv, **kwargs):
+                pass
+
+            def poll(self):
+                raise KeyboardInterrupt   # Ctrl-C, or SIGTERM / SIGHUP turned into SystemExit by `run`
+
+            def terminate(self):
+                events.append("terminate")
+
+            def wait(self, timeout=None):
+                events.append("wait")
+
+        training = {"lr": 1e-4, "warmup": 50, "min_lr_ratio": 0.3, "anchors": 64, "grad_accum": 1, "inner_steps": 10}
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(join.subprocess, "Popen", Running):
+            site = self.site(tmp, None)
+            with self.assertRaises(KeyboardInterrupt):
+                site._trainer({"client_id": "c4", "canary": False, "data": [], "base": {"path": "b"}},
+                              {"training": training})
+        self.assertEqual(events, ["terminate", "wait"])
 
     def test_redeem_without_a_terminal_exits_cleanly(self):   # dogfood: EOFError after printing the terms
         import contextlib

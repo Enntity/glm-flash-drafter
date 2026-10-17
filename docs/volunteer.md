@@ -177,8 +177,10 @@ The coordinator serves a public dashboard at its base path: current global versi
 group over versions (rounded, at least an hour old), the operator-published Atlas benchmark table, the weakest
 groups ("wanted"),
 aggregate reasons for held or quarantined deltas, and network totals. A "how it works" page explains validation.
-Heartbeats carry only phase, round, version, token counters, throughput, GPU power, MFU and GPU count; any other
-field is refused. The audit log (registrations, invite use, verdicts, revocations) is admin-only.
+A site's status ages out: `stale` after two missed heartbeats, `offline` after 15 minutes, `stopped` after a clean
+stop. Heartbeats carry only phase, round, version, token counters, throughput, GPU power, MFU, GPU count and, after
+a failed pre-upload self-check, its reason code, count, canary flag and worst check-set drop (shown to the operator
+only); any other field is refused. The audit log (registrations, invite use, verdicts, revocations) is admin-only.
 
 ## Not built yet
 

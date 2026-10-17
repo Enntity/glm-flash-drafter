@@ -31,11 +31,15 @@ DISPLAY = re.compile(r"^[\w][\w .'-]{0,31}$", re.UNICODE)
 TAG = re.compile(r"^[\w.:+-]{1,64}$", re.UNICODE)
 VERSION_TEXT = re.compile(r"^[\w.+-]{1,40}$")
 PHASES = ("idle", "setup", "canary", "claiming", "generating", "capturing", "pulling", "training", "checking",
-          "uploading", "waiting", "cleaning", "error")
+          "uploading", "waiting", "cleaning", "error", "stopped")
 HEARTBEAT_FIELDS = {   # name: (type, min, max); anything else is refused (no free text, no hostnames)
     "phase": (str, None, None), "round": (int, 0, 10**9), "version": (int, 0, 10**9), "tokens": (float, 0, 1e15),
     "tokens_per_s": (float, 0, 1e9), "gpu_w": (float, 0, 1e5), "mfu": (float, 0, 1), "gpus": (int, 0, 64),
     "step": (int, 0, 10**12), "client": (str, None, None), "shard_id": (str, None, None),
+    # failed self-checks since the last passing one (nothing was uploaded): a REASONS code, the canary flag and the
+    # worst relative drop on the public check set; no data, no free text
+    "check_failed": (int, 0, 10**6), "check_code": (str, None, None), "check_canary": (int, 0, 1),
+    "check_drop": (float, -1e3, 1e3),
 }
 DELTA_META = {"tokens": (float, 0, 1e15), "steps": (int, 1, 10**9), "step_start": (int, 0, 10**12),
               "step_end": (int, 1, 10**12), "inner_steps": (int, 1, 10**9), "delta_dtype": (str, None, None),
@@ -43,8 +47,11 @@ DELTA_META = {"tokens": (float, 0, 1e15), "steps": (int, 1, 10**9), "step_start"
               "validator_version": (str, None, None), "client": (str, None, None)}
 #: What the operator must publish before the network issues invites or shard leases (and before a site trains): a
 #: site never falls back to the trainer's command-line defaults.  key: required fields of its JSON object.
+#: ``a|b``: either field.  The batch is ``global_anchors`` (each site picks its micro-batch; ``anchors`` caps it) or,
+#: as before, ``grad_accum`` with ``anchors`` as the micro-batch.
 REQUIRED_SETTINGS = {"requirements": ("trainer", "config_sha256"), "publish_key": (),
-                     "training": ("lr", "warmup", "min_lr_ratio", "anchors", "grad_accum", "inner_steps")}
+                     "training": ("lr", "warmup", "min_lr_ratio", "anchors", "global_anchors|grad_accum",
+                                  "inner_steps")}
 
 
 def missing_settings(values: dict[str, Any], required: dict[str, tuple[str, ...]] = REQUIRED_SETTINGS) -> list[str]:
@@ -56,7 +63,8 @@ def missing_settings(values: dict[str, Any], required: dict[str, tuple[str, ...]
         if not value:
             missing.append(key)
         else:
-            missing += [f"{key}.{f}" for f in fields if not isinstance(value, dict) or value.get(f) is None]
+            missing += [f"{key}.{f}" for f in fields if not isinstance(value, dict)
+                        or all(value.get(k) is None for k in f.split("|"))]
     return missing
 
 
@@ -392,14 +400,34 @@ class Service:
                                                                    "escalated", "updated", "verdict")} for r in rows]
 
     def attention(self) -> dict[str, Any]:
-        """What needs an operator: held deltas, unreviewed quarantines, a pending gate override, unset settings."""
+        """What needs an operator: held deltas, unreviewed quarantines, sites whose self-checks fail (their deltas
+        never arrive), a pending gate override, unset settings."""
 
         with contextlib.closing(self._connect()) as db:
             rows = db.execute("SELECT d.id, d.state, d.reason_code, d.updated, d.escalated, s.public_id FROM deltas d "
                               "JOIN sites s ON s.id=d.site_id WHERE d.state='held' OR (d.state='quarantined' AND "
                               "d.reviewed IS NULL AND d.purged IS NULL) ORDER BY d.updated").fetchall()
             force = self._meta(db, "force_merge")
+            checks, silent = [], []   # failed self-checks (nothing reached the coordinator); sites gone quiet
+            now = self.now()
+            for site in db.execute("SELECT public_id, display_name, last_seen, heartbeat FROM sites WHERE role='site' "
+                                   "AND revoked IS NULL AND last_seen > ?", (now - 86400,)):
+                beat = json.loads(site["heartbeat"] or "{}")
+                status = self.site_status(beat, site["last_seen"], now)
+                if status in ("stale", "offline") and beat.get("phase") not in ("stopped", "idle"):
+                    silent.append({"site": site["public_id"], "name": site["display_name"] or "anonymous",
+                                   "status": status, "last_phase": beat.get("phase"),
+                                   "silent_s": round(now - site["last_seen"])})
+                if beat.get("check_failed"):
+                    kind = "canary self-check" if beat.get("check_canary") else "self-check"
+                    checks.append({"site": site["public_id"], "name": site["display_name"] or "anonymous",
+                                   "failed": beat["check_failed"], "code": beat.get("check_code"),
+                                   "canary": bool(beat.get("check_canary")), "drop": beat.get("check_drop"),
+                                   "last_seen": site["last_seen"],
+                                   "text": f"site {site['display_name'] or site['public_id']}: {kind} failed: "
+                                           f"{beat.get('check_code')} x{beat['check_failed']}"})
         return {"needs_review": [dict(r) | {"age_s": self.now() - r["updated"]} for r in rows],
+                "self_check_failures": checks, "silent_sites": silent,
                 "escalated": sum(1 for r in rows if r["escalated"]), "force_merge_pending": force is not None,
                 "missing_settings": self.missing_settings()}
 
@@ -475,7 +503,8 @@ class Service:
                 "publish_key": self._meta(db, "publish_key"),
                 "training": self._meta(db, "training", {}), "norm_bounds": self._meta(db, "norm_bounds"),
                 "heartbeat_s": self.config.heartbeat_s, "terms_sha256": terms.TERMS_SHA256,
-                "attestation_sha256": terms.ATTESTATION_SHA256,
+                "attestation_sha256": terms.ATTESTATION_SHA256, "heartbeat_fields": sorted(HEARTBEAT_FIELDS),
+                "phases": list(PHASES),
             }
 
     def version_url(self, version: int | None = None) -> dict[str, Any]:
@@ -524,6 +553,8 @@ class Service:
         beat = _typed(body, HEARTBEAT_FIELDS, "heartbeat")
         if beat.get("phase") not in PHASES:
             raise ApiError(400, "bad_request", f"heartbeat.phase must be one of {PHASES}")
+        if beat.get("check_code") is not None and beat["check_code"] not in REASONS:
+            raise ApiError(400, "bad_request", "heartbeat.check_code must be a known reason code")
         now = self.now()
         with self.tx() as db:
             if beat.get("shard_id"):   # lease extension while the site works on it
@@ -956,6 +987,16 @@ class Service:
             entry["deltas_quarantined"] += row["state"] == "quarantined"
         return stats
 
+    def site_status(self, beat: dict[str, Any], last_seen: float | None, now: float) -> str:
+        """The phase a site last reported while its heartbeats are fresh; ``stale`` after two missed heartbeats,
+        ``offline`` after ``online_s`` (a stopped process must not look like it is training)."""
+
+        if last_seen is None or now - last_seen >= self.config.online_s:
+            return "offline"
+        if now - last_seen > 2 * self.config.heartbeat_s:
+            return "stale"
+        return beat.get("phase", "idle")
+
     def dashboard(self) -> dict[str, Any]:
         """Everything the public dashboard shows; no tokens, ids, labels or admin data."""
 
@@ -966,11 +1007,12 @@ class Service:
             sites, online = [], 0
             for row in db.execute("SELECT * FROM sites WHERE role='site' AND revoked IS NULL"):
                 beat = json.loads(row["heartbeat"] or "{}")
-                live = row["last_seen"] is not None and now - row["last_seen"] < self.config.online_s
+                status = self.site_status(beat, row["last_seen"], now)
+                live = status not in ("offline", "stale", "stopped")
                 online += live
                 entry = stats.get(row["id"], {})
                 sites.append({"name": row["display_name"] or "anonymous", "anonymous": row["display_name"] is None,
-                              "status": beat.get("phase", "idle") if live else "offline",
+                              "status": status,
                               "tokens_per_s": beat.get("tokens_per_s") if live else None,
                               "gpus": beat.get("gpus") if live else None,
                               "tokens_received": entry.get("tokens_received", 0.0),

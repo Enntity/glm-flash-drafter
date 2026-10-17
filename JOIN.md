@@ -140,9 +140,40 @@ drafter-join run --teacher <GLM dir> [mode flags]
 ```
 
 It loops until stopped: check versions, claim (recipe) or use your data (byo), pull the global, train one round
-(about 30 minutes), self-check, upload, clean up. Progress lines show the phase and step. Stop with Ctrl-C at any
-time; rerunning resumes the interrupted phase (training resumes from its last checkpoint, uploads resume
-part by part).
+(about 30 minutes), self-check, upload, clean up. Progress lines show the phase and step, and once per run the
+micro-batch the memory probe chose (`micro-batch: 256 anchors x grad_accum 8 x 1 rank(s) = 2048 anchors per
+step`). Stop with Ctrl-C (or SIGTERM) at any time: the trainer stops too and the coordinator is told the site
+stopped. Rerunning resumes the interrupted phase (training resumes from its last checkpoint, uploads resume part
+by part).
+
+**Keep it running after you log out.** A plain `drafter-join run` stops with the shell that started it. Use one of:
+
+```
+tmux new -s drafter 'ulimit -n $(ulimit -Hn); drafter-join run --teacher <GLM dir> [mode flags]'   # detach: Ctrl-b d
+
+setsid nohup bash -c 'ulimit -n $(ulimit -Hn); exec drafter-join run --teacher <GLM dir> [mode flags]' \
+    >> ~/.enntity-drafter/run.log 2>&1 < /dev/null &                                     # stop: pkill -f 'drafter-join run'
+```
+
+or a systemd user unit, `~/.config/systemd/user/drafter-join.service` (absolute paths; `loginctl enable-linger
+$USER` keeps it running without a login):
+
+```
+[Unit]
+Description=drafter-join volunteer site
+
+[Service]
+WorkingDirectory=<repository>
+ExecStart=/bin/bash -c 'ulimit -n $(ulimit -Hn) && exec <repository>/.venv/bin/drafter-join run --teacher <GLM dir> [mode flags]'
+Restart=on-failure
+RestartSec=300
+
+[Install]
+WantedBy=default.target
+```
+
+then `systemctl --user daemon-reload && systemctl --user enable --now drafter-join` (logs: `journalctl --user -u
+drafter-join -f`; stop: `systemctl --user stop drafter-join`).
 
 ## 6. Verify
 
@@ -164,7 +195,7 @@ invite link (the part before `/join`, `https://<host>/<path>/`).
 | `canary not accepted` | fix the cause named in the message, then rerun the same `drafter-join setup` command (it runs a new canary) |
 | `training failed ... see <log>` with `Python.h` or a compiler error | Triton cannot compile: see the prerequisites in step 1, then rerun setup |
 | `the network has not published training settings yet` | nothing to do on your side; `run` waits and retries, or rerun setup later |
-| `training failed ... see <log>` | read the log; rerun to resume; out-of-memory: lower `--anchors` via `--trainer-arg` or stop other processes |
+| `training failed ... see <log>` | read the log; rerun to resume (the memory probe runs again first); out-of-memory or `probe_low_memory`: stop other processes, or as a last resort cap the micro-batch with `--trainer-arg=--anchors=256` (the client warns that it overrides the network's setting; with a network `global_anchors` the probe already picks a smaller micro-batch by itself) |
 | `no recipe shard is open` | the client waits and retries; or switch to bring-your-own mode |
 | `waiting (...)` | nothing to do: the finished delta is kept and the client continues by itself (for example it runs a canary first, then uploads the delta) |
 | `... The delta is kept at <work>/unmergeable/...` | the network changed in a way that makes that delta unusable; it is kept for inspection and the next round starts |

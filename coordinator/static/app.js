@@ -87,7 +87,8 @@ function render(d) {
   document.getElementById("sites").replaceChildren(sites.length ? table(
     ["#", "Site", "Status", "Tokens/s", "Tokens received", "Deltas accepted", "Pending review"],
     sites.map((s, i) => [i + 1, el("span", s.anonymous ? { class: "anon" } : {}, s.name),
-      el("span", { class: "status " + (s.status === "offline" ? "off" : "on") }, s.status),
+      el("span", { class: "status " + ({ offline: "off", stopped: "off", stale: "warn" }[s.status] || "on") },
+        s.status),
       num(s.tokens_per_s), num(s.tokens_received), s.deltas_accepted, s.deltas_pending]), [0, 3, 4, 5, 6])
     : el("p", { class: "empty" }, "No sites yet."));
   const wanted = d.wanted || {};

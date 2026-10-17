@@ -333,6 +333,48 @@ class TrainingTests(unittest.TestCase, Fixture):
         self.assertEqual(last_eval(resumed / "train.jsonl"), last_eval(two16 / "train.jsonl"))
         print("  accum-4 resume at 3 -> 6 reproduces the uninterrupted params exactly")
 
+    def test_global_anchors_picks_the_micro_batch_and_probes_on_resume(self):   # dogfood: memory guard kills
+        """--global-anchors: the largest micro-batch the probe finds memory for, grad_accum derived; the probe runs
+        again on resume (it was skipped, and memory shared with other services had dropped meanwhile)."""
+
+        from enntity_drafter.train import batch_candidates, choose_batch
+
+        self.assertEqual(batch_candidates(512, 1, 2048, 1),
+                         [(512, 4), (256, 8), (128, 16), (64, 32), (32, 64), (16, 128), (8, 256)])
+        self.assertEqual(batch_candidates(512, 4, 2048, 2)[:2], [(512, 2), (256, 4)])   # x ranks
+        self.assertEqual(batch_candidates(64, 4, None, 2), [(64, 4)])   # today's anchors + grad_accum
+        with self.assertRaises(SystemExit):
+            batch_candidates(512, 1, 1000, 3)
+        probed = []
+        chosen, records = choose_batch(batch_candidates(512, 1, 2048, 1),
+                                       lambda a: (probed.append(a) or a <= 128, {"anchors": a}))
+        self.assertEqual((chosen, probed), ((128, 16), [512, 256, 128]))
+        self.assertEqual([r["fits"] for r in records], [False, False, True])
+        self.assertEqual(choose_batch([(8, 4)], lambda a: (False, {"anchors": a}))[0], None)
+
+        def records_of(output: Path) -> list[dict]:
+            return [json.loads(line) for line in (output / "train.jsonl").read_text().splitlines()]
+
+        def params(output: Path, step: int) -> dict[str, torch.Tensor]:
+            return guarded_torch_load(output / "checkpoints" / f"step-{step:07d}" / "rank0.pt", "drafter")["params"]
+
+        common = ("--steps", "4", "--eval-every", "0", "--checkpoint-every", "2", "--probe")
+        reference, adaptive = self.root / "global-ref", self.root / "global-adaptive"
+        self.run_cmd(self.train_cmd(reference, *common, "--grad-accum", "2", ranks=1))
+        adaptive_cmd = self.train_cmd(adaptive, *common, "--global-anchors", "64", ranks=1)   # --anchors 32: cap
+        self.run_cmd(adaptive_cmd + ["--stop-after", "2"])
+        batch = [r for r in records_of(adaptive) if r["phase"] == "batch"][0]
+        self.assertEqual((batch["anchors"], batch["grad_accum"], batch["global_anchors"]), (32, 2, 64))
+        env = {**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "DRAFTER_FAKE_MEMAVAIL_GB": "5"}
+        done = subprocess.run(adaptive_cmd + ["--min-free-gb", "8"], cwd=REPO, env=env, capture_output=True,
+                              text=True, timeout=1800)
+        self.assertEqual(done.returncode, 3, done.stderr[-2000:])
+        tail = records_of(adaptive)
+        self.assertEqual((tail[-1]["phase"], tail[-1]["reason"], tail[-1]["step"]), ("abort", "probe_low_memory", 2))
+        self.assertEqual([r["anchors"] for r in tail if r["phase"] == "probe" and r["step"] == 2], [32, 16, 8])
+        self.run_cmd(adaptive_cmd)   # memory is back: the resumed run replays the reference stream exactly
+        self.assertTrue(all(torch.equal(v, params(reference, 4)[k]) for k, v in params(adaptive, 4).items()))
+
     def test_sdpa_attention_matches_eager(self):
         """--attn sdpa (bool mask, fused kernel) computes the same model as eager (float mask)."""
 

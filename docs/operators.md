@@ -84,13 +84,13 @@ python -m coordinator validator --label gpu-1                  # validator token
 python -m coordinator add-shards --builder coverage --builder-args '{"seed": 31, "profile": "long", "prefix": "v1"}' \
     --generation '{"samples": 2}' --rows-per-shard 500 --total 8000
 python -m coordinator set training '{"lr": 1e-4, "warmup": 50, "min_lr_ratio": 0.3, "anchors": 512,
-    "grad_accum": 4, "inner_steps": <see below>, "steps": 10000000, "canary_steps": 20, "delta_dtype": "int8"}'
+    "global_anchors": 2048, "inner_steps": <see below>, "steps": 10000000, "canary_steps": 20, "delta_dtype": "int8"}'
 python -m coordinator set requirements '{"trainer": "scratch-v1", "config_sha256": "<printed by validator init>"}'
 python -m coordinator set benchmarks @bench.json               # {"columns": [...], "rows": [[...]], "note": "..."}
 python -m coordinator set wanted_notes '["long-form prose", "multilingual prose"]'
 python -m coordinator set publish_key '"<hex printed by validator init>"'   # sites pin it at registration
 python -m coordinator release DELTA_ID accept|reject [--weight-factor 0.5]   # held deltas (borderline, merge gate)
-python -m coordinator attention                                # what needs you, including missing settings
+python -m coordinator attention                                # what needs you (see below)
 python -m coordinator audit --limit 100
 ```
 
@@ -101,11 +101,15 @@ python -m coordinator audit --limit 100
 2. `set publish_key` and `set requirements` with what `init` printed.
 3. `set training`. Sites never train on the trainer's command-line defaults (anchors 64 and a learning rate for
    training from scratch): a site refuses to train until `training` holds at least `lr`, `warmup`, `min_lr_ratio`,
-   `anchors`, `grad_accum` and `inner_steps`, and waits instead. Recommended values for continued training from a
-   trained version 0: `lr` 1e-4, `warmup` 50, `min_lr_ratio` 0.3, `anchors` 512, `grad_accum` 4. Size
-   `inner_steps` so a round is about 30 minutes of training on one GB10: 1800 / `step_s`, where `step_s` is the
-   seconds per optimizer step the trainer logs (`train.jsonl`) at these `anchors` and `grad_accum` (for example
-   500 at 3.6 s/step).
+   `anchors`, `global_anchors` (or, as before, `grad_accum`) and `inner_steps`, and waits instead. Recommended
+   values for continued training from a trained version 0: `lr` 1e-4, `warmup` 50, `min_lr_ratio` 0.3,
+   `global_anchors` 2048 (anchors per optimizer step), `anchors` 512. `global_anchors` is the batch every site
+   trains with; `anchors` is only the largest micro-batch a site may use: each site's memory probe picks the
+   largest micro-batch that leaves its memory floor free (a GB10 shared with other services may get 256 or 128)
+   and sets `grad_accum` so micro x accum x GPUs = `global_anchors`. Without `global_anchors`, `anchors` and
+   `grad_accum` are used as given on every site (the old behaviour). Size `inner_steps` so a round is about 30
+   minutes of training on one GB10: 1800 / `step_s`, where `step_s` is the seconds per optimizer step the trainer
+   logs (`train.jsonl`) at this batch (for example 500 at 3.6 s/step).
 4. Invites (`python -m coordinator invite`).
 
 The coordinator enforces the order: until `requirements` (with `trainer` and `config_sha256`), `publish_key` and
@@ -113,9 +117,17 @@ The coordinator enforces the order: until `requirements` (with `trainer` and `co
 missing, and `attention` lists the missing settings under `missing_settings`. A site that registered before
 `publish_key` was set would adopt the first key it is offered.
 
+`attention` also lists `self_check_failures` (sites whose deltas failed their own pre-upload check, so nothing
+arrived: for example "site X: canary self-check failed: heldout_regression x2", with the worst public check-set
+drop; reported in heartbeats, no data) and `silent_sites` (sites seen in the last day whose heartbeats stopped
+without a clean stop: `stale` after two missed heartbeats, `offline` after `DRAFTER_ONLINE_S`, 15 minutes). The
+dashboard shows the same statuses, so a stopped process never looks like it is training.
+
 `training` is the only trainer configuration a site takes from the network, and the client accepts only typed
-numeric keys from it (`lr`, `warmup`, `min_lr_ratio`, `anchors`, `weight_decay`, `beta1`, `beta2`, `clip`,
-`grad_accum`, `crop`, plus `inner_steps`, `steps`, `canary_steps`, `delta_dtype`). `min_lr_ratio` 1 keeps the
+numeric keys from it (`lr`, `warmup`, `min_lr_ratio`, `anchors`, `global_anchors`, `weight_decay`, `beta1`,
+`beta2`, `clip`, `grad_accum`, `crop`, plus `inner_steps`, `steps`, `canary_steps`, `delta_dtype`). A site's own
+`--trainer-arg` still wins (for example a lower `--anchors` cap); the client prints a warning when it overrides a
+network setting. `min_lr_ratio` 1 keeps the
 learning rate constant after warmup. Shard recipes must use builders and seeds whose prompts are disjoint from the
 held-out set.
 

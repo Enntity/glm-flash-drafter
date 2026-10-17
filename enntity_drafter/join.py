@@ -50,8 +50,11 @@ CLIENT_VERSION = "0.1.0"
 SHARD_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")   # coordinator-supplied ids become directory names
 HOME = Path(os.environ.get("DRAFTER_HOME", Path.home() / ".enntity-drafter"))
 #: Published training settings a site accepts, with their types (nothing else from the network reaches argv).
+#: ``global_anchors`` (anchors per optimizer step): the trainer's probe picks the micro-batch (at most ``anchors``)
+#: and derives grad_accum; without it ``anchors`` and ``grad_accum`` are used as given.
 TRAINING_KEYS = {"lr": float, "warmup": int, "min_lr_ratio": float, "anchors": int, "weight_decay": float,
-                 "beta1": float, "beta2": float, "clip": float, "grad_accum": int, "crop": int}
+                 "beta1": float, "beta2": float, "clip": float, "grad_accum": int, "crop": int, "global_anchors": int}
+MEMORY_GUARDS = ("--min-free-gb", "12", "--probe-headroom-gb", "4")   # CUDA sites, unless given locally
 FINAL = ("accepted", "merged", "quarantined")
 CHECK_FRACTION = 0.05   # rows of a shard kept out of training as the public self-check set
 CHECK_ROWS_MAX = 64     # ... at most this many rows of a large bring-your-own index
@@ -342,6 +345,10 @@ class Site:
         self.state = json.loads(self.state_path.read_text()) if self.state_path.is_file() else {
             "rounds": 0, "tokens": 0.0, "outbox": [], "cycle": None}
         self.phase, self.beat_stop, self.live = "idle", threading.Event(), {}
+        self.warned: set[str] = set()   # --trainer-arg overrides already reported in this process
+        self.batch: dict[str, Any] | None = None   # the trainer's chosen micro-batch, reported once
+        self.heartbeat_fields: list[str] = []   # optional heartbeat fields the coordinator accepts
+        self.phases: list[str] = []             # heartbeat phases it accepts (older ones: no "stopped")
 
     # ------------------------------------------------------------------ state
     def save(self) -> None:
@@ -375,6 +382,8 @@ class Site:
             raise JoinError("the coordinator has no global weights yet; try again later")
         if req.get("terms_sha256") != terms.TERMS_SHA256:
             raise JoinError("the participation terms changed; run `drafter-join update`")
+        self.heartbeat_fields = list(req.get("heartbeat_fields") or [])   # absent on older coordinators
+        self.phases = list(req.get("phases") or [])
         return req
 
     @staticmethod
@@ -404,6 +413,12 @@ class Site:
         for key in ("tokens_per_s", "gpu_w", "mfu", "step"):
             if self.live.get(key) is not None:
                 body[key] = self.live[key]
+        failed = self.state.get("self_check") or {}
+        if failed and "check_failed" in self.heartbeat_fields:   # what the operator cannot see otherwise
+            body.update(check_failed=int(failed["failed"]), check_code=failed["code"],
+                        check_canary=int(failed["canary"]))
+            if failed.get("drop") is not None:
+                body["check_drop"] = float(failed["drop"])
         try:
             self.api.call("POST", "/api/v1/heartbeat", body)
         except ApiError as error:
@@ -449,17 +464,26 @@ class Site:
                 "--keep-checkpoints", "2", "--delta-out", str(delta),
                 "--delta-dtype", str(training.get("delta_dtype", "int8")), "--seed", str(seed),
                 "--delta-meta", json.dumps({"client_id": cycle["client_id"], "canary": canary}), "--log-every", "10"]
-        for key, kind in TRAINING_KEYS.items():
-            if key in training:
-                argv += [f"--{key.replace('_', '-')}", str(kind(training[key]))]
+        network = {f"--{k.replace('_', '-')}": str(kind(training[k])) for k, kind in TRAINING_KEYS.items()
+                   if k in training and not (k == "grad_accum" and "global_anchors" in training)}
+        argv += [a for flag, value in network.items() for a in (flag, value)]
+        self._warn_overrides(network)
         argv += self.local_trainer_args()
         log = self.work / "logs" / f"train-{cycle['client_id']}.log"
         log.parent.mkdir(parents=True, exist_ok=True)
         with log.open("a") as stream:
             proc = subprocess.Popen(argv, cwd=REPO, stdout=stream, stderr=subprocess.STDOUT)
-            while proc.poll() is None:
-                self._progress(out / "train.jsonl", inner)
-                time.sleep(2)
+            try:
+                while proc.poll() is None:
+                    self._progress(out / "train.jsonl", inner)
+                    time.sleep(2)
+            except BaseException:   # stopped (Ctrl-C, SIGTERM): the trainer stops too; its checkpoint resumes
+                proc.terminate()
+                try:
+                    proc.wait(60)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                raise
         self._progress(out / "train.jsonl", inner)
         if proc.returncode or not delta.is_file():
             again = "drafter-join setup` with the same flags" if canary else "drafter-join run`"
@@ -471,6 +495,12 @@ class Site:
         if not log.is_file():
             return
         lines = log.read_text().splitlines()
+        batch = next((json.loads(l) for l in reversed(lines) if '"phase": "batch"' in l), None)
+        if batch is not None and batch != self.batch:
+            self.batch = batch
+            print()
+            say(f"micro-batch: {batch['anchors']} anchors x grad_accum {batch['grad_accum']} x {batch['ranks']} "
+                f"rank(s) = {batch['global_anchors']} anchors per step (probed {batch['probed']})")
         train = next((json.loads(l) for l in reversed(lines) if '"phase": "train"' in l), None)
         if train:
             self.live = {"tokens_per_s": train.get("supervised_tok_per_s"), "gpu_w": train.get("gpu_w"),
@@ -480,14 +510,33 @@ class Site:
 
     def local_trainer_args(self) -> list[str]:
         """The site's own flags, plus memory guards on CUDA unless given: GB10 CPU and GPU share memory and
-        exhausting it can hang the host, so stop cleanly below 12 GiB free and probe the worst case first."""
+        exhausting it can hang the host, so stop cleanly below 12 GiB free, and probe the worst case at every start
+        and resume (memory shared with other services changes; the probe also sizes the micro-batch)."""
 
         local = list(self.opts.trainer_arg)
         import torch
 
-        if torch.cuda.is_available() and not any(a.startswith("--min-free-gb") for a in local):
-            local += ["--min-free-gb", "12", "--probe"]
+        if torch.cuda.is_available():
+            for flag, value in zip(MEMORY_GUARDS[::2], MEMORY_GUARDS[1::2]):
+                if not any(a.split("=")[0] == flag for a in local):
+                    local += [flag, value]
+            if "--probe" not in local:
+                local.append("--probe")
         return local
+
+    def _warn_overrides(self, network: dict[str, str]) -> None:
+        """--trainer-arg wins over the network's settings (an escape hatch, for example a smaller --anchors on a
+        host with less memory); say so once per flag."""
+
+        local = self.opts.trainer_arg
+        flags = {a.split("=")[0] for a in local}
+        if "--global-anchors" in network:
+            network = {**network, "--grad-accum": "derived from --global-anchors"}
+        for flag in sorted(flags & set(network) - self.warned):
+            note = (" (with --global-anchors this only lowers the micro-batch cap; prefer letting the probe choose)"
+                    if flag == "--anchors" and "--global-anchors" in network else "")
+            say(f"warning: --trainer-arg {flag} overrides the network's setting {flag} {network[flag]}{note}")
+            self.warned.add(flag)
 
     def launcher(self) -> list[str]:
         if self.opts.launcher:
@@ -511,6 +560,7 @@ class Site:
             stats = check_delta(delta, base, {"base_sha256": cycle["base"]["sha256"], **{
                 k: v for k, v in self.pins().items() if k != "validator_version"}}, bounds)
         except CheckFailed as failure:
+            self._check_failed(cycle, failure.code, None)
             raise self._set_aside(cycle, "failed-checks", f"self-check failed before upload ({failure.code}): "
                                                           f"{failure.message}; nothing was uploaded") from failure
         if not self.opts.no_public_check:
@@ -527,12 +577,28 @@ class Site:
             finally:
                 candidate.unlink(missing_ok=True)
             if base_m is not None:
-                decision, code, message, _ = (judge_canary if canary else judge)(base_m, cand_m, Thresholds())
+                decision, code, message, drops = (judge_canary if canary else judge)(base_m, cand_m, Thresholds())
                 if decision == "reject":
+                    self._check_failed(cycle, code, max(drops.values(), default=None))
                     raise self._set_aside(cycle, "failed-checks", f"self-check on the public check set failed "
                                                                   f"({code}): {message}; nothing was uploaded")
                 stats["public_check"] = {"base": base_m, "candidate": cand_m}
+        if self.state.pop("self_check", None):
+            self.save()
         return stats
+
+    def _check_failed(self, cycle: dict[str, Any], code: str, drop: float | None) -> None:
+        """Count a failed self-check (nothing is uploaded, so only the heartbeat tells the operator) and report it
+        at once: a reason code, the canary flag and the worst relative drop; no data."""
+
+        from coordinator.service import REASONS
+
+        last = self.state.get("self_check") or {"failed": 0}
+        self.state["self_check"] = {"failed": last["failed"] + 1, "code": code if code in REASONS else "malformed",
+                                    "canary": bool(cycle.get("canary")), "drop": drop}
+        self.save()
+        self.phase = "error"
+        self.heartbeat()
 
     def cycle(self) -> dict[str, Any]:
         """One canary or round, resumable at every phase."""
@@ -788,6 +854,14 @@ class Site:
                 done += not result["canary"]
         finally:
             self.beat_stop.set()
+            self.stopped()
+
+    def stopped(self) -> None:
+        """A last heartbeat on any exit, so the dashboard does not show a stopped site as training."""
+
+        self.phase = "stopped" if "stopped" in self.phases else "idle"   # older coordinators: no "stopped"
+        self.live = {}
+        self.heartbeat()
 
 
 # --------------------------------------------------------------------------
@@ -1075,11 +1149,20 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if opts.cmd == "status":
             site = site_from(opts)
-            print(json.dumps({"local": {k: site.state.get(k) for k in ("rounds", "tokens", "outbox", "cycle", "parked")},
+            print(json.dumps({"local": {k: site.state.get(k) for k in ("rounds", "tokens", "outbox", "cycle", "parked",
+                                                                         "self_check")},
                               "pins": site.pins(), "coordinator": site.api.call("GET", "/api/v1/me")}, indent=1))
             return 0
         if opts.teacher is None:
             raise JoinError("--teacher is required (your GLM-5.3-Flash directory with the embedding and lm_head)")
+        import signal
+
+        def stop(number: int, frame) -> None:   # SIGTERM / SIGHUP (a closed shell): unwind, stop the trainer, report
+            raise SystemExit(128 + number)
+
+        for name in ("SIGTERM", "SIGHUP"):
+            if signal.getsignal(getattr(signal, name)) is not signal.SIG_IGN:   # nohup keeps SIGHUP ignored
+                signal.signal(getattr(signal, name), stop)
         site_from(opts).run(opts.rounds)
         return 0
     except JoinError as error:
