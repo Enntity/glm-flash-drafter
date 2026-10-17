@@ -838,8 +838,12 @@ class Service:
             if body.get("norm_bounds") is not None:
                 self._set_meta(db, "norm_bounds", body["norm_bounds"])
             if body.get("forced"):
-                db.execute("DELETE FROM meta WHERE key='force_merge'")
                 self._audit(db, "merge.gate_overridden", self._actor(validator), str(version))
+            elif self._meta(db, "force_merge") is not None:
+                self._audit(db, "merge.gate_override_cleared", self._actor(validator), str(version))
+            # A gate override covers exactly one publish: clear it on every publish so it can never
+            # stay armed and later skip the gate for unrelated deltas.
+            db.execute("DELETE FROM meta WHERE key='force_merge'")
             self._audit(db, "version.published", self._actor(validator), str(version), sha256=upload["sha256"],
                         merged=len(merged))
         self.collect_versions()

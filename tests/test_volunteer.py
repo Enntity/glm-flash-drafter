@@ -270,6 +270,11 @@ class ClientTests(unittest.TestCase):
         codes |= {"rate_limited", "internal"}
         self.assertGreater(len(codes), 25)
         self.assertEqual(sorted(codes - set(join.UPLOAD_ACTIONS)), [])
+        # a non-JSON reply from a proxy (coordinator restarting behind it) retries; unknown codes stop, keeping everything
+        for status in ("500", "502", "503", "504", "408", "429"):
+            self.assertEqual(join.upload_action(f"http_{status}")[0], "retry", status)
+        self.assertEqual(join.upload_action("http_418"), ("stop", None))
+        self.assertEqual(join.upload_action("never_seen_before"), ("stop", None))
         with tempfile.TemporaryDirectory() as tmp:
             opts = join.build_parser().parse_args(["run", "--work", tmp, "--config", str(TINY)])
             site = join.Site(ApiClient("http://127.0.0.1:9", retries=0), "token", Path(tmp), opts)
@@ -533,6 +538,17 @@ class FailureInjectionTests(unittest.TestCase):
         self.assertEqual({self.states()[i][0] for i in ids}, {"merged"})
         self.assertIn("merge.gate_overridden", [e["event"] for e in self.net.admin_call("GET", "/admin/audit")])
         self.assertFalse(self.net.admin_call("GET", "/admin/attention")["force_merge_pending"])
+
+    def test_gate_override_is_cleared_by_the_next_normal_publish(self):   # final review: override stays armed
+        with self.net.service.tx() as db:
+            self.net.service._set_meta(db, "force_merge", {"by": "admin", "ts": 0, "delta": "d_unrelated"})
+        self.assertTrue(self.net.admin_call("GET", "/admin/attention")["force_merge_pending"])
+        ids = [self.upload(site) for site in self.sites]
+        self.validator.step()   # a merge that passes the gate on its own
+        self.assertEqual(self.current()[0], 1)
+        self.assertEqual({self.states()[i][0] for i in ids}, {"merged"})
+        self.assertFalse(self.net.admin_call("GET", "/admin/attention")["force_merge_pending"])
+        self.assertIn("merge.gate_override_cleared", [e["event"] for e in self.net.admin_call("GET", "/admin/audit")])
 
     def test_gate_compares_one_coherent_best_version_with_a_noise_margin(self):   # re-review N2
         self.validator.state["best"] = {"version": 4, "metrics": {"a": 5.0, "b": 4.0}}

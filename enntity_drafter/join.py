@@ -87,6 +87,20 @@ UPLOAD_ACTIONS: dict[str, tuple[str, float | None]] = {
 }
 
 
+def upload_action(code: str) -> tuple[str, float | None]:
+    """The action for an upload error code. A non-JSON reply from a proxy arrives as ``http_<status>``:
+    server-side and throttling statuses retry (a coordinator restart behind the proxy must not set work
+    aside); any other unknown code stops with the delta and cycle kept, never discarding or setting aside."""
+
+    if code in UPLOAD_ACTIONS:
+        return UPLOAD_ACTIONS[code]
+    if code.startswith("http_"):
+        status = code[5:]
+        if status.isdigit() and (status.startswith("5") or status in ("408", "425", "429")):
+            return ("retry", 60)
+    return ("stop", None)
+
+
 def say(message: str) -> None:
     print(f"[drafter-join] {message}", flush=True)
 
@@ -544,7 +558,7 @@ class Site:
     def upload_error(self, cycle: dict[str, Any], error: ApiError) -> JoinError:
         """Apply :data:`UPLOAD_ACTIONS` to a failed upload of a finished delta; never discards it."""
 
-        action, wait = UPLOAD_ACTIONS.get(error.code, ("aside_stop", None))
+        action, wait = upload_action(error.code)
         why = f"{error.code}: {error.message}"
         if action == "retry":
             return JoinError(f"waiting ({why}); the delta is kept and its upload resumes", wait)

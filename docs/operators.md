@@ -16,7 +16,8 @@ DRAFTER_PUBLIC_URL=https://<your host>/drafter docker compose up -d --build
 
 - Put a TLS reverse proxy in front of `127.0.0.1:8080` and route `<base path>/*` to it with the prefix kept.
   **Set `DRAFTER_TRUSTED_PROXIES`** to the proxy's address as the container sees it (for Traefik: its address on
-  the shared Docker network). Only requests from that address have their rightmost `X-Forwarded-For` entry used
+  the shared Docker network), or to that network's CIDR range so a proxy restart with a new address keeps working;
+  comma-separate several entries. Only requests from that address have their rightmost `X-Forwarded-For` entry used
   as the client address for rate limits; without it every client would share one bucket. The compose file sets
   `DRAFTER_PROXY_MODE=1`, which refuses to start until the variable is set; outside proxy mode a missing value is
   logged as a warning and limits are per connection. IPs are only held in memory. Invite redemption allows a

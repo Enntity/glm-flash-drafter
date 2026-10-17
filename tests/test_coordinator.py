@@ -623,10 +623,11 @@ class ReviewRegressionTests(unittest.TestCase):
                 return error.code
             return 200
 
-        self.net.app.trusted_proxies = {"127.0.0.1"}
+        import ipaddress
+        self.net.app.trusted_proxies = [ipaddress.ip_network("127.0.0.0/8")]   # CIDR: any proxy address in the range
         self.assertEqual([redeem("9.9.9.9, 1.1.1.1") for _ in range(21)], [403] * 20 + [429])
         self.assertEqual(redeem("1.1.1.1, 2.2.2.2"), 403)   # the rightmost hop is the client: its own bucket
-        self.net.app.trusted_proxies = set()
+        self.net.app.trusted_proxies = []
         self.net.app.limiter.buckets.clear()
         self.assertEqual([redeem(f"10.0.0.{i}") for i in range(21)], [403] * 20 + [429])   # spoofed hops ignored
         from coordinator.__main__ import check_proxy_config

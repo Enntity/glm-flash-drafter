@@ -110,7 +110,7 @@ class Handler(BaseHTTPRequestHandler):
 
         peer = self.client_address[0]
         forwarded = self.headers.get("X-Forwarded-For")
-        if forwarded and peer in self.app.trusted_proxies:
+        if forwarded and self.app.is_trusted_proxy(peer):
             return forwarded.split(",")[-1].strip()
         return peer
 
@@ -138,7 +138,10 @@ class App:
 
     def __init__(self, service: Service, base_path: str = "/drafter", admin: bool = False):
         self.service, self.admin = service, admin
-        self.trusted_proxies = {p.strip() for p in service.config.trusted_proxies.split(",") if p.strip()}
+        # Exact addresses or CIDR ranges (e.g. the proxy's Docker network), so a proxy address change
+        # inside the configured network keeps per-client rate limits.
+        self.trusted_proxies = [ipaddress.ip_network(p.strip(), strict=False)
+                                for p in service.config.trusted_proxies.split(",") if p.strip()]
         self.base = "/" + base_path.strip("/") if base_path.strip("/") else ""
         self.limiter = RateLimiter()
         s = service
@@ -196,6 +199,14 @@ class App:
                  lambda h, b, m: s.refresh_upload(h.site, m["id"], b.get("parts") or [])),
             ]
         self.compiled = [(method, _route(path), kind, fn) for method, path, kind, fn in self.routes]
+
+
+    def is_trusted_proxy(self, peer: str) -> bool:
+        try:
+            address = ipaddress.ip_address(peer)
+        except ValueError:
+            return False
+        return any(address in network for network in self.trusted_proxies)
 
     def handle(self, h: Handler) -> None:
         parts = urlsplit(h.path)
