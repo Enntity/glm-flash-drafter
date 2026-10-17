@@ -5,8 +5,9 @@ quarantined or held delta), validate pending deltas (canaries first), then merge
 ready.  Validation of one delta: download and verify size and SHA-256, the shared checks
 (:func:`enntity_drafter.validation.check_delta`, the same code sites run before uploading), optional spot check
 (recipe mode), then the held-out eval of ``base - delta`` against the base, judged conservatively
-(:func:`~enntity_drafter.validation.judge`).  A crash leaves the delta claimed; the coordinator hands it out again
-after its claim timeout, so no verdict is lost or doubled.
+(:func:`~enntity_drafter.validation.judge`; a canary, never merged, gets the sanity checks and only a catastrophic
+bound, :func:`~enntity_drafter.validation.judge_canary`).  A crash leaves the delta claimed; the coordinator hands it
+out again after its claim timeout, so no verdict is lost or doubled.
 
 Merge (:func:`merge_streamed`): token-weighted plain average of the accepted deltas (staleness down-weighted by
 ``stale_decay ** versions_behind``, borderline ones by their reduced factor), outer step lr 1 / momentum 0 by
@@ -33,8 +34,8 @@ from coordinator.client import ApiClient, ApiError, download, sha256_file, uploa
 from enntity_drafter import diloco as dl
 from enntity_drafter.guard import guarded_safe_open
 from enntity_drafter.validation import (
-    VALIDATOR_VERSION, CheckFailed, StreamWriter, Thresholds, candidate_weights, check_delta, judge, layout,
-    norm_bounds, read_header, weights_stamp,
+    VALIDATOR_VERSION, CheckFailed, StreamWriter, Thresholds, candidate_weights, canary_bounds, check_delta, judge,
+    judge_canary, layout, norm_bounds, read_header, weights_stamp,
 )
 
 
@@ -328,11 +329,12 @@ class Validator:
                 raise CheckFailed("hash_mismatch", "the stored file differs from the declared size/SHA-256; "
                                                    "upload it again") from error
             base = self.ensure_version(item["base_version"], item["base_sha256"])
+            bounds = norm_bounds(self.state["history"], self.thresholds)
             try:   # anything unparseable in an uploaded file is the file's fault: quarantine, never crash-loop
                 stats = check_delta(path, base, {"base_sha256": item["base_sha256"],
                                                  "trainer": self.requirements.get("trainer"),
                                                  "config_sha256": self.requirements.get("config_sha256")},
-                                    norm_bounds(self.state["history"], self.thresholds))
+                                    canary_bounds(bounds) if item["canary"] else bounds)
             except CheckFailed:
                 raise
             except Exception as error:  # noqa: BLE001
@@ -361,7 +363,8 @@ class Validator:
             candidate_weights(base, path, candidate)
             cand = self.evaluate(candidate)
             base_metrics = self.metrics(item["base_sha256"], base)
-            decision, code, message, _ = judge(base_metrics, cand, self.thresholds)
+            decision, code, message, _ = (judge_canary if item["canary"] else judge)(base_metrics, cand,
+                                                                                    self.thresholds)
             if relaxed is not None and decision == "accept":
                 decision, code, message = "reduce", "duplicate_lease", f"same shard as {relaxed}, another lease"
             verdict.update(metrics=cand, base_metrics=base_metrics)
@@ -372,10 +375,10 @@ class Validator:
         verdict.update(decision=decision, code=code, reason=message,
                        weight_factor=self.thresholds.reduce_weight if decision == "reduce" else 1.0)
         if decision in ("accept", "reduce"):
-            self.state["history"] = (self.state["history"] + [verdict["checks"]["rms"]])[-200:]
-            if item["canary"]:   # canaries are not merged: never compare later deltas against them
+            if item["canary"]:   # canaries are not merged: never compare later deltas or norms against them
                 path.unlink(missing_ok=True)
             else:   # stored once; later deltas of the round are compared against it
+                self.state["history"] = (self.state["history"] + [verdict["checks"]["rms"]])[-200:]
                 dl._save(self.workdir / "sketches" / f"{item['delta_id']}.sketch.safetensors", {"sketch": mine.float()},
                          {dl.SCRATCH_STAMP_KEY: json.dumps({"lineage_root": "enntity-scratch-init",
                                                             "warm_start": "none", "kind": "sketch"})})

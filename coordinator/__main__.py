@@ -18,7 +18,7 @@ from pathlib import Path
 
 from . import storage as st
 from .server import App, make_server
-from .service import Config, Service
+from .service import ApiError, Config, Service
 
 
 def check_proxy_config(env: dict[str, str]) -> None:
@@ -156,4 +156,7 @@ def main(argv: list[str] | None = None) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ApiError as error:   # an operator mistake (for example an invite before the settings): no traceback
+        raise SystemExit(f"{error.code}: {error.message}") from None

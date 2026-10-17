@@ -60,7 +60,7 @@ class Net:
     def __init__(self, root: Path, part_size: int = 1024, **config):
         self.root, self.clock = root, Clock()
         self.storage = LocalStorage(root / "objects", "http://placeholder", b"k" * 32, part_size=part_size)
-        self.config = Config(**{"require_canary": False, "curve_delay_s": 0.0, **config})
+        self.config = Config(**{"require_canary": False, "require_settings": False, "curve_delay_s": 0.0, **config})
         self.start()
 
     def start(self) -> None:
@@ -438,6 +438,32 @@ class ReviewRegressionTests(unittest.TestCase):
         self.accept(first["delta_id"])
         later = send_delta(site, self.new_blob(), 0, self.v0, "canary-0004", canary=True)   # flag ignored again
         self.assertFalse(site.call("GET", f"/api/v1/deltas/{later['delta_id']}")["canary"])
+
+    def test_no_invites_or_leases_until_the_settings_are_published(self):   # dogfood: trained on CLI defaults
+        site = self.net.register("early")   # registered before the check was switched on
+        self.net.admin_call("POST", "/admin/shards", {"recipes": [{"builder": "synthetic", "rows": [0, 4]}]})
+        self.net.service.config.require_settings = True
+
+        def refused(missing: list[str]) -> None:
+            self.assertEqual(self.net.admin_call("GET", "/admin/attention")["missing_settings"], missing)
+            for call in (lambda: self.net.admin_call("POST", "/admin/invites", {}),
+                         lambda: site.call("POST", "/api/v1/shards/claim")):
+                with self.assertRaises(ApiError) as error:
+                    call()
+                self.assertEqual((error.exception.status, error.exception.code), (409, "not_ready"))
+                self.assertIn(", ".join(missing), error.exception.message)
+
+        refused(["publish_key", "training"])
+        self.net.admin_call("POST", "/admin/settings/publish_key", {"value": "ab" * 32})
+        self.net.admin_call("POST", "/admin/settings/training", {"value": {}})   # the dogfood network's value
+        refused(["training"])
+        self.net.admin_call("POST", "/admin/settings/training", {"value": {"lr": 1e-4, "warmup": 50}})
+        refused(["training.min_lr_ratio", "training.anchors", "training.grad_accum", "training.inner_steps"])
+        self.net.admin_call("POST", "/admin/settings/training", {"value": {
+            "lr": 1e-4, "warmup": 50, "min_lr_ratio": 0.3, "anchors": 512, "grad_accum": 4, "inner_steps": 250}})
+        self.assertEqual(self.net.admin_call("GET", "/admin/attention")["missing_settings"], [])
+        self.assertIn("#invite=", self.net.admin_call("POST", "/admin/invites", {})["url"])
+        self.assertEqual(site.call("POST", "/api/v1/shards/claim")["shard"]["id"], "s000000")
 
     def test_upload_quotas_reaper_retention_and_disk_guard(self):   # review 2 (pending limit) and 4
         site = self.net.register("quinn")

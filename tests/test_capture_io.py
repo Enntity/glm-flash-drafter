@@ -819,6 +819,32 @@ class CaptureTrainingTests(unittest.TestCase, CaptureFixture):
         self.assertEqual(records[-1]["phase"], "eval")
         self.assertEqual(records[-1]["rows"], len(site.split("heldout")))
 
+    def test_byo_captures_are_indexed_by_drafter_join(self):
+        """``drafter-join --byo-captures GLOB --byo-manifest FILE`` builds the index a newcomer had to build by hand
+        (``capture_io index --fast GLOB --manifest FILE``); held-out rows the manifest marks stay out of training."""
+
+        from enntity_drafter import join
+
+        meta = [json.loads(line) for line in (self.root / "meta.jsonl").read_text().splitlines()]
+        fast = sorted(p.name for p in (self.root / "data" / "fast").iterdir())
+        listed = [m for m in meta if m["name"] in fast[1:]]   # the first fast row is not in the manifest
+        manifest = self.root / "manifest-train.jsonl"
+        manifest.write_text("".join(json.dumps(m) + "\n" for m in listed))
+        work = self.root / "byo-captures-work"
+        path = join.byo_source_index(self.root / "data", ["fast"], [manifest], work / "byo-source-index", self.cfg)
+        index = json.loads(path.read_text())
+        self.assertEqual(sorted(r["name"] for r in index["rows"]), sorted(m["name"] for m in listed))
+        held = {m["name"] for m in listed if m["kind"] == "heldout"}
+        self.assertTrue(held)
+        self.assertEqual({r["name"] for r in index["rows"] if r["split"] != "train"}, held)
+        args = join.byo_capture_index(path, work / "byo-index")
+        site = cd.CaptureIndex(Path(args[1]), self.root / "data")
+        self.assertEqual({r["name"] for r in site.rows}, {m["name"] for m in listed} - held)
+        with tempfile.TemporaryDirectory() as tmp:   # flag combinations that cannot work stop before anything runs
+            for bad in (["--byo-manifest", str(manifest)], ["--byo-captures", "fast"],
+                        ["--byo-captures", "fast", "--byo-capture-root", tmp, "--byo-capture-index", str(path)]):
+                self.assertEqual(join.main(["--home", tmp, "status", "--work", tmp, "--mode", "byo", *bad]), 2, bad)
+
 
 class RecipePipelineIndexTests(unittest.TestCase):
     def test_recipe_pipeline_indexes_its_captured_rows(self):

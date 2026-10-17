@@ -9,6 +9,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -194,3 +195,18 @@ class ExportScriptTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InstallScriptTests(unittest.TestCase):
+    @unittest.skipUnless((REPO / "third_party" / "speculators" / ".git").is_dir(), "speculators not cloned")
+    def test_speculators_install_keeps_torch_and_skips_torchaudio_torchvision(self):   # dogfood: mismatched wheels
+        done = subprocess.run(["bash", str(REPO / "scripts" / "install_speculators.sh"), "--print-deps"],
+                              capture_output=True, text=True, env={**os.environ, "PYTHON": sys.executable})
+        self.assertEqual(done.returncode, 0, done.stderr)
+        deps = done.stdout.split()
+        self.assertEqual(deps[-1], "torch==" + torch.__version__.split("+")[0])   # the installed torch, pinned
+        names = [re.split(r"[<>=!~;\[]", d, maxsplit=1)[0] for d in deps[:-1]]
+        self.assertFalse({"torch", "torchaudio", "torchvision"} & set(names), names)
+        self.assertIn("transformers>=5.0.0,<5.17.0", deps)   # speculators' tested range, kept on purpose
+        script = (REPO / "scripts" / "install_speculators.sh").read_text()
+        self.assertIn('pip install --no-deps "$DIR/hs_connectors" "$DIR"', script)

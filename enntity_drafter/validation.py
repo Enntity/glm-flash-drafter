@@ -10,6 +10,9 @@ site cannot see: the private held-out set.
 * :func:`judge`: compare held-out metrics of candidate and base; conservative thresholds: accept unless a group's
   expected accepted length (``eal``) drops; a drop beyond ``hold_drop`` is borderline (merged at reduced weight or
   held for the operator), only a drop beyond ``reject_drop`` is a rejection.
+* :func:`judge_canary`: the canary's verdict.  A canary (a few steps from a fresh optimizer, never merged) proves the
+  pipeline and may legitimately dip, so it gets the tensor sanity checks (:func:`canary_bounds`) and only a
+  catastrophic bound: a held-out group below ``canary_floor`` x the base score.  Never the merge thresholds.
 * :func:`evaluate`: the trainer's held-out proxy (``train.py --eval-only``) on a weights file.
 
 Bump :data:`VALIDATOR_VERSION` on any change to these rules: the coordinator then re-validates every quarantined or
@@ -33,7 +36,7 @@ import torch
 from . import diloco as dl
 from .guard import ForbiddenCheckpointError, check_path, guarded_safe_open
 
-VALIDATOR_VERSION = "1"
+VALIDATOR_VERSION = "2"   # 2: canaries are judged by judge_canary
 ST_DTYPES = {torch.float32: "F32", torch.bfloat16: "BF16", torch.int8: "I8"}
 ST_NAMES = {v: k for k, v in ST_DTYPES.items()}
 
@@ -52,6 +55,7 @@ class Thresholds:
     min_token_sites: int = 3       # with fewer sites in a round, every site weighs the same
     near_duplicate: float = 0.995  # cosine above which two deltas of a round count as copies
     gate_drop: float = 0.01        # a merged global may score at most this much below the best published one
+    canary_floor: float = 0.5      # a canary is rejected only if a held-out group falls below this x the base score
 
 
 class CheckFailed(Exception):
@@ -219,33 +223,66 @@ def metrics_of(record: dict[str, Any], key: str = "eal") -> dict[str, float]:
     return out
 
 
-def judge(base: dict[str, float], candidate: dict[str, float], thresholds: Thresholds
-          ) -> tuple[str, str | None, str, dict[str, float]]:
-    """(decision accept|reduce|hold|reject, code, message, relative drop per group).  Decided on groups only;
-    per-category buckets (names with a dot) are reported, not judged (too few rows to decide on)."""
+def _drops(base: dict[str, float], candidate: dict[str, float]
+           ) -> tuple[tuple[str, str, str, dict] | None, dict[str, float], str, str]:
+    """(early verdict or None, relative drop per group, worst judged group, its detail).  Judged groups are the ones
+    without a dot; per-category buckets are reported, not judged (too few rows to decide on).  Fails closed: every
+    base group must be scored, and every score must be a finite number."""
 
     judged = [g for g in base if "." not in g]
     if not judged:
-        return "hold", "no_metrics", "no held-out group to judge on", {}
-    for g in judged:   # fail closed: every base group must be scored, and every score must be a finite number
+        return ("hold", "no_metrics", "no held-out group to judge on", {}), {}, "", ""
+    for g in judged:
         value, reference = candidate.get(g), base[g]
         if not isinstance(value, (int, float)) or not math.isfinite(value):
-            return "reject", "heldout_invalid", f"held-out group {g} has no finite score", {}
+            return ("reject", "heldout_invalid", f"held-out group {g} has no finite score", {}), {}, "", ""
         if not isinstance(reference, (int, float)) or not math.isfinite(reference) or reference <= 0:
-            return "reject", "heldout_invalid", f"base score of held-out group {g} is not a positive number", {}
+            return (("reject", "heldout_invalid", f"base score of held-out group {g} is not a positive number", {}),
+                    {}, "", "")
     drops = {g: (base[g] - candidate[g]) / base[g] for g in base
              if isinstance(candidate.get(g), (int, float)) and math.isfinite(candidate[g])
              and isinstance(base[g], (int, float)) and math.isfinite(base[g]) and base[g] > 0}
-    groups = {g: drops[g] for g in judged}
-    worst_group = max(groups, key=groups.get)
-    worst = groups[worst_group]
-    detail = f"{worst_group}: eal {base[worst_group]:.4f} -> {candidate[worst_group]:.4f} ({-worst:+.2%})"
+    worst_group = max(judged, key=drops.get)
+    worst = drops[worst_group]
+    return None, drops, worst_group, (f"{worst_group}: eal {base[worst_group]:.4f} -> {candidate[worst_group]:.4f} "
+                                      f"({-worst:+.2%})")
+
+
+def judge(base: dict[str, float], candidate: dict[str, float], thresholds: Thresholds
+          ) -> tuple[str, str | None, str, dict[str, float]]:
+    """(decision accept|reduce|hold|reject, code, message, relative drop per group) for a delta that would be
+    merged.  Decided on groups only (:func:`_drops`)."""
+
+    early, drops, worst_group, detail = _drops(base, candidate)
+    if early is not None:
+        return early
+    worst = drops[worst_group]
     if worst > thresholds.reject_drop:
         return "reject", "heldout_regression", f"clear held-out regression, {detail}", drops
     if worst > thresholds.hold_drop:
         decision = "reduce" if thresholds.borderline == "reduce" else "hold"
         return decision, "heldout_borderline", f"borderline held-out change, {detail}", drops
     return "accept", None, f"ok, worst group {detail}", drops
+
+
+def judge_canary(base: dict[str, float], candidate: dict[str, float], thresholds: Thresholds
+                 ) -> tuple[str, str | None, str, dict[str, float]]:
+    """:func:`judge` for a canary: accept unless the scores are invalid or a held-out group collapses below
+    ``canary_floor`` x its base score.  A canary is never merged, so a dip says nothing about the site."""
+
+    early, drops, worst_group, detail = _drops(base, candidate)
+    if early is not None:
+        return early
+    if 1.0 - drops[worst_group] < thresholds.canary_floor:
+        return "reject", "canary_collapse", f"the canary collapsed a held-out group, {detail}", drops
+    return "accept", None, f"canary ok (sanity checks only), worst group {detail}", drops
+
+
+def canary_bounds(bounds: dict[str, float] | None) -> dict[str, float]:
+    """The norm bounds a canary must meet: ``max_abs`` and ``max_rms``, not ``min_rms`` (a canary trains a few steps,
+    so it is smaller than the round deltas the bounds are measured on; an all-zero delta still fails)."""
+
+    return {k: v for k, v in (bounds or {}).items() if k != "min_rms"}
 
 
 def evaluate(weights: str | Path, eval_args: list[str], inprocess: bool = True) -> dict[str, Any]:

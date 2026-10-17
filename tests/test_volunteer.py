@@ -47,7 +47,7 @@ from enntity_drafter.train import TRAINER_VERSION  # noqa: E402
 from enntity_drafter.validation import Thresholds, evaluate, metrics_of  # noqa: E402
 from test_coordinator import Net, send_delta  # noqa: E402
 from coordinator.client import ApiError  # noqa: E402
-from enntity_drafter.validation import judge  # noqa: E402
+from enntity_drafter.validation import canary_bounds, judge, judge_canary  # noqa: E402
 from validator.worker import Validator, merge_weights  # noqa: E402
 
 H, ROUNDS = 20, 3
@@ -138,6 +138,7 @@ class EndToEndTests(unittest.TestCase):
         net.admin_call("POST", "/admin/settings/requirements", {"value": pins})
         net.admin_call("POST", "/admin/settings/training", {"value": {
             "inner_steps": H, "steps": H * ROUNDS, "canary_steps": 5, "lr": 2e-3, "warmup": 30, "anchors": 32,
+            "min_lr_ratio": 0.1, "grad_accum": 1,   # the trainer defaults the reference run uses
             "weight_decay": 0.0, "delta_dtype": "fp32"}})
         net.admin_call("POST", "/admin/shards", {"recipes": [self.recipe] * (ROUNDS + 1)})
         eval_args = ["--config", str(TINY), "--teacher", str(root / "target"), "--features", str(root / "heldout"),
@@ -356,6 +357,135 @@ class ClientTests(unittest.TestCase):
         weights = merge_weights([item("a", 1e12), item("a", 1e12), item("b", 1000.0), item("c", 2000.0),
                                  item("d", 3000.0)], 5, thresholds)
         self.assertEqual(weights, [3000.0, 3000.0, 1000.0, 2000.0, 3000.0])   # a: 2 x median site, split
+
+    def test_canary_judge_is_sanity_only(self):   # dogfood: a canary rejected for an 8% public check-set dip
+        thresholds = Thresholds()
+        base = {"heldout": 5.0, "agentic": 4.0, "heldout.prose": 3.0}
+        dip = {"heldout": 5.0 * (1 - 0.082), "agentic": 4.0, "heldout.prose": 0.1}
+        self.assertEqual(judge(base, dip, thresholds)[:2], ("reject", "heldout_regression"))   # a real delta
+        self.assertEqual(judge_canary(base, dip, thresholds)[:2], ("accept", None))
+        self.assertEqual(judge_canary(base, {"heldout": 2.4, "agentic": 4.0}, thresholds)[:2],
+                         ("reject", "canary_collapse"))   # below half the base score
+        self.assertEqual(judge_canary(base, {"heldout": float("nan"), "agentic": 4.0}, thresholds)[:2],
+                         ("reject", "heldout_invalid"))
+        self.assertEqual(canary_bounds({"max_abs": 10.0, "max_rms": 1e-3, "min_rms": 1e-5}),
+                         {"max_abs": 10.0, "max_rms": 1e-3})   # a few steps are smaller than a round
+        self.assertEqual(canary_bounds(None), {})
+
+    def site(self, tmp: str, api) -> join.Site:
+        opts = join.build_parser().parse_args(["run", "--work", tmp, "--config", str(TINY), "--teacher", tmp,
+                                               "--mode", "byo", "--byo-features", tmp])
+        return join.Site(api, "token", Path(tmp), opts)
+
+    def test_canary_self_check_uses_the_canary_gate(self):
+        from unittest import mock
+
+        from enntity_drafter import validation
+
+        seen, scores = [], []
+        patches = [mock.patch.object(validation, "check_delta", lambda d, b, e, bounds: seen.append(bounds) or
+                                     {"meta": {}}),
+                   mock.patch.object(validation, "candidate_weights", lambda *a: None),
+                   mock.patch.object(validation, "evaluate", lambda *a, **k: {}),
+                   mock.patch.object(validation, "metrics_of", lambda record: scores.pop(0))]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        req = {"norm_bounds": {"max_abs": 10.0, "max_rms": 1e-3, "min_rms": 1e-5}}
+        with tempfile.TemporaryDirectory() as tmp:
+            site = self.site(tmp, None)
+            for canary, candidate, failure in ((True, 4.59, None), (False, 4.59, "heldout_regression"),
+                                               (True, 2.0, "canary_collapse")):
+                cycle = {"client_id": "c1", "canary": canary, "data": [],
+                         "base": {"path": str(Path(tmp) / "base.safetensors"), "sha256": "0" * 64}}
+                scores[:] = [{"heldout": 5.0}, {"heldout": candidate}]
+                if failure is None:
+                    self.assertIn("public_check", site._self_check(cycle, Path(tmp) / "d.safetensors", req))
+                else:
+                    with self.assertRaises(join.JoinError) as error:
+                        site._self_check(cycle, Path(tmp) / "d.safetensors", req)
+                    self.assertIn(failure, str(error.exception))
+                    # the message names the next command: setup reruns the canary, run starts a new round
+                    self.assertIn("`drafter-join setup` with the same flags" if canary else "`drafter-join run`",
+                                  str(error.exception))
+            self.assertEqual([("min_rms" in b) for b in seen], [False, True, False])
+
+    def test_no_training_before_the_network_publishes_training_settings(self):   # dogfood: `training: {}`
+        with tempfile.TemporaryDirectory() as tmp:
+            calls, training = [], {}
+
+            class Fake:
+                def call(self, method, path, body=None, auth=True):
+                    calls.append((method, path))
+                    return {**site.pins(), "version": 0, "canary_required": True, "open_deltas": 0,
+                            "terms_sha256": terms.TERMS_SHA256, "training": training}
+
+            site = self.site(tmp, Fake())
+            for value, missing in (({}, "training"), ({"lr": 1e-4, "warmup": 50, "anchors": 512},
+                                                      "training.min_lr_ratio, training.grad_accum, "
+                                                      "training.inner_steps")):
+                training.clear()
+                training.update(value)
+                with self.assertRaises(join.JoinError) as error:
+                    site.cycle()
+                self.assertIn(f"has not published training settings yet (missing: {missing})", str(error.exception))
+                self.assertEqual(error.exception.wait, 600)   # `run` waits and retries; nothing ran on defaults
+                self.assertIsNone(site.state["cycle"])
+            self.assertEqual({m for m, _ in calls}, {"GET"})   # nothing claimed, uploaded or trained
+            with self.assertRaises(join.JoinError):   # a resumed cycle cannot reach the trainer either
+                site._trainer({"client_id": "c2", "canary": False, "data": []}, {"training": {"lr": 1e-4}})
+
+    def test_redeem_without_a_terminal_exits_cleanly(self):   # dogfood: EOFError after printing the terms
+        import contextlib
+        import io
+        from unittest import mock
+
+        class Terms:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def call(self, method, path, body=None, auth=True):
+                assert path == "/api/v1/terms", path   # never redeems
+                return {"sha256": terms.TERMS_SHA256, "text": "TERMS", "attestation": {"text": "ATTEST"}}
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(join, "ApiClient", Terms), \
+                mock.patch("sys.stdin", io.StringIO("")):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = join.main(["--home", tmp, "redeem", "https://example.org/drafter/join#invite=inv_abc"])
+            self.assertEqual(code, 2)
+            self.assertIn("rerun with --accept-terms after reading the terms above", out.getvalue())
+            self.assertIn("TERMS", out.getvalue())
+            self.assertFalse((Path(tmp) / "config.json").exists())
+
+    def test_preflight_catches_missing_build_deps_and_a_low_open_file_limit(self):   # dogfood: Python.h, ulimit
+        import resource
+        import subprocess as sp
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            for gpu, status in ((False, None), (True, False)):
+                ok, detail = join.build_check(gpu, Path(tmp))
+                self.assertIs(ok, status)
+                for fix in ("python3-dev", "uv python install 3.12", "container"):
+                    self.assertIn(fix, detail)
+            (Path(tmp) / "Python.h").write_text("")
+            self.assertIs(join.build_check(False, Path(tmp))[0], True)
+            failed = sp.CompletedProcess([], 1, "", "fatal error: Python.h: No such file or directory")
+            with mock.patch.object(join.subprocess, "run", return_value=failed):
+                ok, detail = join.build_check(True, Path(tmp))   # the kernel compile is what really decides
+            self.assertFalse(ok)
+            self.assertIn("Python.h: No such file", detail)
+            with mock.patch.object(join.subprocess, "run", return_value=sp.CompletedProcess([], 0, "", "")):
+                self.assertIs(join.build_check(True, Path(tmp))[0], True)
+        for limits, status, text in (((1024, 500000), None, "ulimit -n $(ulimit -Hn)"),
+                                     ((1024, 4096), None, "hard limit is below"),
+                                     ((join.NOFILE_MIN, join.NOFILE_MIN), True, "soft limit"),
+                                     ((resource.RLIM_INFINITY, resource.RLIM_INFINITY), True, "soft limit")):
+            with mock.patch.object(resource, "getrlimit", return_value=limits):
+                ok, detail = join.open_file_check()
+            self.assertIs(ok, status, limits)
+            self.assertIn(text, detail)
 
 
 # --------------------------------------------------------------------------
@@ -612,6 +742,30 @@ class FailureInjectionTests(unittest.TestCase):
         self.net.clock.t += 61
         self.validator.step()
         self.assertEqual({self.states()[d][0] for d in (first, second)}, {"merged"})
+
+    def test_canary_dip_is_accepted_and_only_a_collapse_rejected(self):   # dogfood: canary gate
+        self.net.service.config.require_canary = True
+        version, sha, base = self.current()
+
+        def away(step: float) -> Path:   # local = base moved away from the target: the held-out score drops
+            self.count += 1
+            return write_delta(self.root / f"delta{self.count}.safetensors",
+                               {k: step * (self.toy.target[k] - base[k]) for k in base}, sha, PINS)
+
+        history = list(self.validator.state["history"])
+        dip, collapse, real = away(0.03), away(0.3), away(0.031)   # about -9% and -90% of the held-out score
+        self.net.pass_canary(self.sites[0])
+        canaries = [self.net.register(name) for name in ("cleo", "dora")]
+        ids = [send_delta(site, path, version, sha, f"canary-{k:04d}")["delta_id"]
+               for k, (site, path) in enumerate(zip(canaries, (dip, collapse)))]
+        ids.append(send_delta(self.sites[0], real, version, sha, "real-0001")["delta_id"])   # not a canary
+        self.validator.step()
+        status = [site.call("GET", f"/api/v1/deltas/{i}") for site, i in zip([*canaries, self.sites[0]], ids)]
+        self.assertEqual([s["canary"] for s in status], [True, True, False])
+        self.assertEqual([(s["state"], s["reason_code"]) for s in status],
+                         [("accepted", None), ("quarantined", "canary_collapse"), ("quarantined", "heldout_regression")])
+        self.assertEqual(self.validator.state["history"], history)   # a canary's norm never sets the bounds
+        self.assertFalse(canaries[0].call("GET", "/api/v1/requirements")["canary_required"])
 
     def test_relased_shard_duplicate_merges_at_reduced_weight(self):   # re-review N4
         self.net.admin_call("POST", "/admin/shards", {"recipes": [{"builder": "synthetic", "rows": [0, 8]}]})

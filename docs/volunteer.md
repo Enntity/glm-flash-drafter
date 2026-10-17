@@ -4,9 +4,10 @@ Several sites train one drafter together, exchanging only weights, never data. T
 speculative-decoding drafter. This page covers the design, what a site spends, the trust model and what is not
 built yet. To run a site, follow [JOIN.md](../JOIN.md); to operate the network, see [operators.md](operators.md).
 
-Status: **built and tested on CPU, not deployed.** No hosted coordinator exists yet. Everything below runs in this
-repository's tests on a tiny model; the full-size path (capture, GB10 training, object storage) has not been run end
-to end across sites.
+Status: **live, invite-only pilot.** Enntity runs a coordinator and a validator; sites join with an invite link
+from the operator, and the coordinator URL is the part of that link before `/join`. Its public dashboard is at that
+URL itself (`https://<host>/<path>/`). Everything below also runs in this repository's tests on a tiny model; the
+full-size recipe path (generation and capture on a site) has not yet been run end to end across sites.
 
 ## How it works
 
@@ -134,6 +135,15 @@ weights (a test enforces that it imports no tensor library).
   a short run (20 steps by default, at most 50) whose delta goes through the full validation path. The coordinator,
   not the client, decides that a delta is a canary, and refuses a long delta from a site that still owes one. Long rounds start only
   after it is accepted; `drafter-join setup` ends with it.
+- **A canary is judged for sanity, not for progress.** It proves the pipeline, is never merged, and a few steps from
+  a fresh optimizer can legitimately score lower than the global. The site's self-check and the validator both
+  check it for sanity only (finite values, tensor shapes and dtypes, base hash, file format and size, norm bounds
+  except the lower one) plus one catastrophic bound: it is rejected (`canary_collapse`) only if a held-out group
+  falls below half of the base score. The merge thresholds (`heldout_borderline`, `heldout_regression`) apply only
+  to deltas that would be merged. A healthy site never loses its first hours to a canary dip.
+- **No training on guesses.** A site trains only with the training settings the network publishes; until the
+  operator has published them, it waits instead of falling back to the trainer's defaults (and the coordinator
+  issues no invites or shard leases).
 - **No late version surprises.** Pins are checked by the client before training and by the coordinator at upload
   initiation, never after the bytes have moved. A round finished against a still-retained base is accepted even if
   the validator version changed meanwhile; the canary runs in the next cycle. Every error code the coordinator can
@@ -172,8 +182,7 @@ field is refused. The audit log (registrations, invite use, verdicts, revocation
 
 ## Not built yet
 
-- A hosted coordinator and validator. Nothing is deployed.
-- A full-size run across real sites. The recipe pipeline in `drafter-join` (prompts, teacher text, capture, FP8,
+- A full-size run across several real sites. The recipe pipeline in `drafter-join` (prompts, teacher text, capture, FP8,
   index) calls the repository's scripts but has not been run end to end; `setup`'s GPU, peer and Atlas checks have
   not been run on GB10 hardware. The S3 and GCS backends are tested for request signing only, not against real
   buckets.

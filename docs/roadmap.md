@@ -39,16 +39,16 @@ is also the unit a volunteer site would run.
 
 ## 4. Low-communication training across sites (DiLoCo-style)
 
-**done** (code and CPU tests; not deployed): the trainer's `--sync-mode diloco` (process group, shared directory,
-or `external` rounds for volunteer sites), the coordinator (`coordinator/`), the validator and merger
-(`validator/`) and the site client (`drafter-join`, `enntity_drafter/join.py`). Plain averaging (outer learning
-rate 1, no momentum) is the default: in a two-site, three-sync A/B on the full model it matched or beat
-synchronous training on held-out groups, while the OpenDiLoCo momentum setting fell well behind. Details:
-[volunteer.md](volunteer.md).
+**done** (code and CPU tests; a coordinator and validator run an invite-only pilot): the trainer's
+`--sync-mode diloco` (process group, shared directory, or `external` rounds for volunteer sites), the coordinator
+(`coordinator/`), the validator and merger (`validator/`) and the site client (`drafter-join`,
+`enntity_drafter/join.py`). Plain averaging (outer learning rate 1, no momentum) is the default: in a two-site,
+three-sync A/B on the full model it matched or beat synchronous training on held-out groups, while the OpenDiLoCo
+momentum setting fell well behind. Details: [volunteer.md](volunteer.md).
 
 Next:
 
-- A hosted coordinator and validator, then a pilot with invited sites.
+- More invited sites in the pilot.
 - A full-size run across two real sites (the recipe pipeline in `drafter-join` and `setup`'s hardware checks are
   untested on GB10 so far).
 - int8 deltas (1.18 GB instead of 2.34 GB, 0.79% error on a real delta) and overlapped fragment syncs

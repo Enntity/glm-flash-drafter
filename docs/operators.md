@@ -83,20 +83,40 @@ python -m coordinator sites  | revoke-site PUBLIC_ID           # revocation stop
 python -m coordinator validator --label gpu-1                  # validator token, printed once
 python -m coordinator add-shards --builder coverage --builder-args '{"seed": 31, "profile": "long", "prefix": "v1"}' \
     --generation '{"samples": 2}' --rows-per-shard 500 --total 8000
-python -m coordinator set training '{"inner_steps": 500, "steps": 10000000, "canary_steps": 20, "lr": 3e-4,
-    "warmup": 50, "min_lr_ratio": 1.0, "delta_dtype": "int8"}'
+python -m coordinator set training '{"lr": 1e-4, "warmup": 50, "min_lr_ratio": 0.3, "anchors": 512,
+    "grad_accum": 4, "inner_steps": <see below>, "steps": 10000000, "canary_steps": 20, "delta_dtype": "int8"}'
 python -m coordinator set requirements '{"trainer": "scratch-v1", "config_sha256": "<printed by validator init>"}'
 python -m coordinator set benchmarks @bench.json               # {"columns": [...], "rows": [[...]], "note": "..."}
 python -m coordinator set wanted_notes '["long-form prose", "multilingual prose"]'
 python -m coordinator set publish_key '"<hex printed by validator init>"'   # sites pin it at registration
 python -m coordinator release DELTA_ID accept|reject [--weight-factor 0.5]   # held deltas (borderline, merge gate)
+python -m coordinator attention                                # what needs you, including missing settings
 python -m coordinator audit --limit 100
 ```
 
+**Setting up a network, in this order (every step is mandatory):**
+
+1. `python -m validator init ...` (see [Validator](#validator)): publishes version 0, prints the publishing key and
+   the `requirements`.
+2. `set publish_key` and `set requirements` with what `init` printed.
+3. `set training`. Sites never train on the trainer's command-line defaults (anchors 64 and a learning rate for
+   training from scratch): a site refuses to train until `training` holds at least `lr`, `warmup`, `min_lr_ratio`,
+   `anchors`, `grad_accum` and `inner_steps`, and waits instead. Recommended values for continued training from a
+   trained version 0: `lr` 1e-4, `warmup` 50, `min_lr_ratio` 0.3, `anchors` 512, `grad_accum` 4. Size
+   `inner_steps` so a round is about 30 minutes of training on one GB10: 1800 / `step_s`, where `step_s` is the
+   seconds per optimizer step the trainer logs (`train.jsonl`) at these `anchors` and `grad_accum` (for example
+   500 at 3.6 s/step).
+4. Invites (`python -m coordinator invite`).
+
+The coordinator enforces the order: until `requirements` (with `trainer` and `config_sha256`), `publish_key` and
+`training` (with the fields above) are set, it refuses invites and shard leases with `not_ready`, naming what is
+missing, and `attention` lists the missing settings under `missing_settings`. A site that registered before
+`publish_key` was set would adopt the first key it is offered.
+
 `training` is the only trainer configuration a site takes from the network, and the client accepts only typed
 numeric keys from it (`lr`, `warmup`, `min_lr_ratio`, `anchors`, `weight_decay`, `beta1`, `beta2`, `clip`,
-`grad_accum`, `crop`, plus `inner_steps`, `steps`, `canary_steps`, `delta_dtype`). Use `min_lr_ratio` 1 (constant
-after warmup) for open-ended runs. Shard recipes must use builders and seeds whose prompts are disjoint from the
+`grad_accum`, `crop`, plus `inner_steps`, `steps`, `canary_steps`, `delta_dtype`). `min_lr_ratio` 1 keeps the
+learning rate constant after warmup. Shard recipes must use builders and seeds whose prompts are disjoint from the
 held-out set.
 
 ## Validator
@@ -112,9 +132,13 @@ Runs on trusted GPU hardware, next to the private held-out set. The validator ho
 - **the only place the signing key exists**: `init` creates it there (0600); keep the validator token beside it.
 
 `--teacher` needs only the target's embedding, final norm and lm_head (a directory with those tensors and the
-target `config.json`), not the full model. Order of the first steps: `validator init` (publishes version 0 and
-prints the key and requirements) → `set publish_key` and `set requirements` → `set training` → invites. A site
-that registers before `publish_key` is set adopts the first key it is offered.
+target `config.json`), not the full model. Order of the first steps: see "Setting up a network" above.
+
+Canaries (a site's first delta, and the first after a pin change) are judged for sanity only: the delta checks
+(provenance, header, base hash, layout, finite values, `max_abs` and `max_rms`; not `min_rms`) and a catastrophic
+bound, rejecting (`canary_collapse`) only if a held-out group falls below half of the base score
+(`Thresholds.canary_floor`). A few steps from a fresh optimizer can legitimately dip, and canaries are never merged.
+Deltas that would be merged keep the conservative `--hold-drop` / `--reject-drop` gate.
 
 ```
 python -m validator init --coordinator https://<host>/drafter --token-file ~/.drafter-validator-token \

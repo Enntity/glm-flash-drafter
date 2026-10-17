@@ -28,6 +28,27 @@ Before you start, you need:
 
 Every command below runs from the repository root.
 
+**Already have captures in this repository's format** (Atlas capture build output such as `<root>/fast-*/p*/`, with
+the capture manifest or capture records that carry each row's metadata)? Skip this page's pipeline. Either let
+`drafter-join` index them on every `setup` and `run`:
+
+```
+drafter-join setup --teacher /models/GLM-5.3-Flash --mode byo --byo-capture-root <root> --byo-captures 'fast-*/p*' \
+    --byo-manifest <root>/manifest-train.jsonl [--byo-exclude-ids <private-ids.jsonl>]
+```
+
+or build the index once yourself and pass it as in [section 6](#6-run):
+
+```
+python -m enntity_drafter.capture_io index --data-root <root> --fast 'fast-*/p*' \
+    --manifest <root>/manifest-train.jsonl --out <root>/index
+drafter-join setup --teacher /models/GLM-5.3-Flash --mode byo --byo-capture-index <root>/index/index.json \
+    --byo-capture-root <root> [--byo-exclude-ids <private-ids.jsonl>]
+```
+
+`--fast` globs are relative to `--data-root`; a manifest is also the allowlist (only rows it lists are indexed),
+and rows it marks held-out are never trained on.
+
 ## Quick start
 
 1. Check the input and see the plan. A dry run writes nothing:
@@ -370,6 +391,7 @@ Bring-your-own options of `drafter-join` (as of this commit):
 |---|---|
 | `--mode byo` | train on your data; nothing is generated or captured by `drafter-join` |
 | `--byo-capture-index FILE` and `--byo-capture-root DIR` | the index this page builds and the directory its paths are relative to (`--work`) |
+| `--byo-captures GLOB` and `--byo-manifest FILE` | instead of `--byo-capture-index`: index captures already in this repository's format under `--byo-capture-root` on every `setup` and `run` (both repeatable; see the top of this page) |
 | `--byo-features DIR` | instead: an `enntity.drafter_rows/v1` row store (`enntity_drafter/data.py`), if you already have one |
 | `--byo-exclude-ids FILE` | JSONL `{"id": ...}` of rows never to train or self-check on (repeatable); for example private held-out rows on the same disks |
 | `--tag LABEL` | an opaque label for your data, shown to the operator (pass `--tag` to `byo_prepare.py` and it is added to the printed commands) |

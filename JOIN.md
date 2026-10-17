@@ -18,6 +18,18 @@ Background: [docs/volunteer.md](docs/volunteer.md). Only weight deltas and count
 
 ## 1. Install
 
+Prerequisites: Python 3.10 or newer **with its development headers** (`Python.h`) and a C compiler. Triton compiles
+the trainer's GPU kernels on the first training step and needs both; the CPU smoke test cannot notice their absence,
+`drafter-join setup` checks them. One of:
+
+- the system Python plus headers: `sudo apt install python3-dev build-essential` (Debian/Ubuntu);
+- without root, a uv-managed CPython (ships its headers):
+  `pip install uv && uv python install 3.12` (or uv's standalone installer), then create the venv below with
+  `"$(uv python find 3.12)" -m venv .venv` instead of `python3 -m venv .venv`;
+- a container whose Python ships its headers and a compiler, for example the official `python:3.12` image (not
+  `-slim`) started with `docker run --gpus all -it -v "$PWD":/work -w /work python:3.12 bash` (needs the NVIDIA
+  Container Toolkit), then the steps below inside it.
+
 ```
 python3 -m venv .venv && . .venv/bin/activate
 pip install 'torch>=2.11,<2.13' numpy safetensors transformers cryptography pyyaml tokenizers jinja2
@@ -26,7 +38,13 @@ pip install -e .
 drafter-join --help
 ```
 
-Check: the last command prints usage starting with `usage: drafter-join`.
+Check: the last command prints usage starting with `usage: drafter-join`. `install_speculators.sh` keeps the
+installed torch and does not install `torchaudio` or `torchvision` (speculators lists them but does not use them;
+`pip check` mentions them, which is expected). It does move `transformers` into speculators' tested range
+(below 5.17), downgrading a newer one on purpose.
+
+In every shell that runs `drafter-join`, raise the open-file limit to the host's hard limit (the loader
+memory-maps many files): `ulimit -n $(ulimit -Hn)`. A fixed large value fails on hosts whose hard limit is lower.
 
 ## 2. Register (once)
 
@@ -36,10 +54,11 @@ Read the terms the command prints, then:
 drafter-join redeem '<invite link>' --accept-terms --name "<display name>"
 ```
 
-Omit `--name` to appear as "anonymous". Check: it prints `registered as ...; token saved to
-~/.enntity-drafter/config.json (mode 0600)`. The config also pins the network's publishing key; every global the
-site downloads must carry that key's signature. An `invite_invalid` error means the link was used, revoked or
-expired: ask the operator for a new one.
+Without a terminal (for example a coding agent), `--accept-terms` is required: without it the command prints the
+terms and stops with exit code 2. Omit `--name` to appear as "anonymous". Check: it prints `registered as ...; token
+saved to ~/.enntity-drafter/config.json (mode 0600)`. The config also pins the network's publishing key; every
+global the site downloads must carry that key's signature. An `invite_invalid` error means the link was used,
+revoked or expired: ask the operator for a new one.
 
 ## 3. Decide the mode
 
@@ -49,13 +68,35 @@ expired: ask the operator for a new one.
   `--mode byo --byo-features DIR` (or `--byo-capture-index FILE --byo-capture-root DIR`), optionally
   `--tag <label>`. Your data never leaves the machine. Nothing is generated or captured in this mode.
 
-With a capture index (for example one built by `python -m enntity_drafter.capture_io index` over captures you
-already have), the client writes its own index under `<work>/byo-index/` and reads the capture files in place:
+**Captures you already have in this repository's format** (Atlas capture build output, for example
+`<root>/fast-*/p*/` row directories, plus the capture manifest or capture records that give each row's metadata):
+let the client index them,
+
+```
+drafter-join setup --teacher <GLM dir> --mode byo --byo-capture-root <root> --byo-captures 'fast-*/p*' \
+    --byo-manifest <root>/manifest-train.jsonl [--byo-exclude-ids <file>] [--tag <label>]
+```
+
+(the same flags for `run`; `--byo-captures` globs are relative to `--byo-capture-root`, both flags repeat, and the
+index is rebuilt under `<work>/byo-source-index/` by every `setup` and `run`), or build the index yourself once and
+pass it with `--byo-capture-index`:
+
+```
+python -m enntity_drafter.capture_io index --data-root <root> --fast 'fast-*/p*' \
+    --manifest <root>/manifest-train.jsonl --out <root>/index
+drafter-join setup --teacher <GLM dir> --mode byo --byo-capture-index <root>/index/index.json \
+    --byo-capture-root <root>
+```
+
+A manifest is also the allowlist: only rows it lists are indexed. Rows it marks held-out stay out of training.
+
+With a capture index the client writes its own index under `<work>/byo-index/` and reads the capture files in place:
 only rows your index marks `train` are used; rows it marks held-out are left alone; up to 64 of the remaining rows
 (a fixed hash carve, as in recipe shards) become the public check set the self-check evaluates; and rows whose
 name, id or prompt id is listed in a `--byo-exclude-ids FILE` (JSONL `{"id": ...}`, repeatable) are never trained or
-evaluated, for example an operator's private held-out rows that sit on the same disks. The run log prints how many
-rows were kept and dropped.
+evaluated, for example an operator's private held-out rows that sit on the same disks (pass
+`--byo-exclude-ids heldout-ids.jsonl` to both `setup` and `run`). The run log prints how many rows were kept and
+dropped.
 
 **Starting from raw data** (your own prompts, chat logs, agent traffic or GLM-5.3-Flash logs) rather than
 captures: follow [docs/byo-data.md](docs/byo-data.md). `python scripts/byo_prepare.py --input FILE --work DIR
@@ -76,11 +117,21 @@ drafter-join setup --teacher <GLM dir> --model-dir <GLM dir> [--peer <second nod
     [mode flags from step 3]
 ```
 
-Expected: one line per check, `PASS`, `WARN` or `FAIL`, then `PASS smoke (tiny train + delta checks)`, then a
-canary (20 training steps from the current global, uploaded and fully validated, a few minutes) ending in
-`canary ... accepted: this site is ready`. Fix every `FAIL` with the hint on its line and rerun. `WARN` lines are
-advisory (for example no RDMA device in bring-your-own mode). A `version mismatch` or `terms changed` message:
-run `drafter-join update --yes`, then rerun setup.
+Expected: one line per check, `PASS`, `WARN` or `FAIL` (including `Triton build`, which compiles a trivial GPU
+kernel, and `open-file limit`), then `PASS smoke (tiny train + delta checks)`, then a canary (20 training steps
+from the current global, uploaded and validated, a few minutes) ending in `canary ... accepted: this site is
+ready`. Fix every `FAIL` with the hint on its line and rerun. `WARN` lines are advisory (for example no RDMA device
+in bring-your-own mode). A `version mismatch` or `terms changed` message: run `drafter-join update --yes`, then
+rerun setup.
+
+The canary proves the pipeline; it is never merged, so it is checked for sanity (finite, shapes, base hash, size)
+and rejected only if it collapses the held-out score, not for a small dip. Setup ends with the canary: if it fails
+or is interrupted, fix the cause and rerun this same `drafter-join setup` command, which checks the host again and
+resumes or reruns the canary. (`drafter-join run` also runs a canary first whenever one is owed: long rounds never
+start before a canary is accepted.)
+
+`the network has not published training settings yet`: the operator has not finished setting up; nothing was
+trained. Rerun later (`drafter-join run` waits and retries by itself).
 
 ## 5. Run
 
@@ -101,14 +152,18 @@ drafter-join status
 
 Check: `coordinator.deltas` lists your deltas with `state` `pending`, `accepted` or `merged`. `quarantined` comes
 with `reason_code` and `reason`; quarantined deltas are kept and re-validated if the validator is fixed, and your
-tokens stay credited. The operator's dashboard (`https://<host>/<path>/`) shows your site and totals.
+tokens stay credited. The network's public dashboard shows your site and totals: open the coordinator URL from your
+invite link (the part before `/join`, `https://<host>/<path>/`).
 
 ## Troubleshooting
 
 | message | action |
 |---|---|
 | `version mismatch` | `drafter-join update --yes`, then `drafter-join run` (a new canary runs first) |
-| `self-check failed before upload` | nothing was uploaded; read the code (layout, non_finite, norm_high ...) and report it with the trainer log path it prints |
+| `self-check failed before upload` | nothing was uploaded; read the code (layout, non_finite, norm_high ...) and report it with the trainer log path it prints; the message ends with the command to run next |
+| `canary not accepted` | fix the cause named in the message, then rerun the same `drafter-join setup` command (it runs a new canary) |
+| `training failed ... see <log>` with `Python.h` or a compiler error | Triton cannot compile: see the prerequisites in step 1, then rerun setup |
+| `the network has not published training settings yet` | nothing to do on your side; `run` waits and retries, or rerun setup later |
 | `training failed ... see <log>` | read the log; rerun to resume; out-of-memory: lower `--anchors` via `--trainer-arg` or stop other processes |
 | `no recipe shard is open` | the client waits and retries; or switch to bring-your-own mode |
 | `waiting (...)` | nothing to do: the finished delta is kept and the client continues by itself (for example it runs a canary first, then uploads the delta) |

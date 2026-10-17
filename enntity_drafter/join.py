@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import platform
 import re
@@ -43,6 +44,7 @@ if str(REPO) not in sys.path:   # the coordinator client and terms live beside t
 
 from coordinator import terms  # noqa: E402
 from coordinator.client import ApiClient, ApiError, download, sha256_file, upload_file  # noqa: E402
+from coordinator.service import REQUIRED_SETTINGS, missing_settings  # noqa: E402
 
 CLIENT_VERSION = "0.1.0"
 SHARD_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")   # coordinator-supplied ids become directory names
@@ -54,6 +56,7 @@ FINAL = ("accepted", "merged", "quarantined")
 CHECK_FRACTION = 0.05   # rows of a shard kept out of training as the public self-check set
 CHECK_ROWS_MAX = 64     # ... at most this many rows of a large bring-your-own index
 CANARY_ROWS = 16        # prompts of the claimed shard a recipe canary generates, captures and trains on
+NOFILE_MIN = 65536      # open-file soft limit: the loader keeps up to 256 memory maps per read thread and rank
 
 
 class JoinError(RuntimeError):
@@ -73,6 +76,7 @@ class JoinError(RuntimeError):
 UPLOAD_ACTIONS: dict[str, tuple[str, float | None]] = {
     "rate_limited": ("retry", 60), "low_disk": ("retry", 600), "too_many_pending": ("retry", 300),
     "too_many_uploads": ("retry", 300), "canary_pending": ("retry", 120), "conflict": ("retry", 10),
+    "not_ready": ("retry", 600),
     "upload_incomplete": ("retry", 30), "unreachable": ("retry", 300), "internal": ("retry", 300),
     "upload_failed": ("retry", 60), "no_url": ("retry", 60), "download_hash": ("retry", 60),
     "download_size": ("retry", 60),
@@ -150,6 +154,9 @@ def redeem(link: str, name: str | None, accept: bool, home: Path = HOME,
         raise JoinError("the coordinator's terms differ from this checkout's; run `drafter-join update` first")
     print(info["text"])
     print(info["attestation"]["text"])
+    if not accept and confirm is None and not (sys.stdin and sys.stdin.isatty()):
+        raise JoinError("no terminal to ask on: rerun with --accept-terms after reading the terms above; nothing "
+                        "was registered")
     if not accept and not (confirm or (lambda q: input(q).strip().lower() == "y"))("Accept these terms? [y/N] "):
         raise JoinError("terms not accepted; nothing was registered")
     reply = api.call("POST", "/api/v1/redeem", {"code": code, "display_name": name, "accept_terms": info["sha256"]},
@@ -238,6 +245,21 @@ def byo_capture_index(index_path: Path, out: Path, exclude: list[Path] = ()) -> 
     say(f"bring-your-own index: {len(keep)} rows ({site['byo']['check_rows']} as the public check set); dropped "
         f"{dropped['not_train']} not marked train and {dropped['excluded']} excluded")
     return ["--capture-index", str(out / "index.json")]
+
+
+def byo_source_index(root: Path, captures: list[str], manifests: list[Path], out: Path, cfg: dict[str, Any]) -> Path:
+    """Index captures already in this repository's format (what ``python -m enntity_drafter.capture_io index
+    --data-root ROOT --fast GLOB --manifest FILE`` does by hand): ``captures`` are globs of capture directories relative
+    to ``root``; a manifest is also the allowlist of rows.  Rebuilt by every ``setup`` and ``run``, so new captures
+    are picked up."""
+
+    from .capture_io import build_index
+
+    index = build_index(Path(root), [], list(captures), [], None, out, window=int(cfg["sliding_window"]),
+                        block=int(cfg["block_size"]), layers=list(cfg["target_layer_ids"]),
+                        manifest=[str(m) for m in manifests] or None)
+    say(f"indexed {len(index['rows'])} captured rows under {root} into {out} (skipped: {index['skipped'] or 'none'})")
+    return out / "index.json"
 
 
 def _run(cmd: list[str], log: Path, env: dict[str, str] | None = None) -> None:
@@ -355,6 +377,16 @@ class Site:
             raise JoinError("the participation terms changed; run `drafter-join update`")
         return req
 
+    @staticmethod
+    def training(req: dict[str, Any]) -> dict[str, Any]:
+        """The network's published training settings; never the trainer's command-line defaults."""
+
+        missing = missing_settings({"training": req.get("training")}, {"training": REQUIRED_SETTINGS["training"]})
+        if missing:
+            raise JoinError(f"the network has not published training settings yet (missing: {', '.join(missing)}); "
+                            "nothing was trained, try again later", wait=600)
+        return req["training"]
+
     # ------------------------------------------------------------------ heartbeat
     def _beat_loop(self, interval: float) -> None:
         while not self.beat_stop.wait(interval):
@@ -401,12 +433,14 @@ class Site:
         return pipeline_store(recipe, out, self.opts, self.set_phase)
 
     def _trainer(self, cycle: dict[str, Any], req: dict[str, Any]) -> Path:
-        training = req.get("training", {})
+        delta = self.work / "outbox" / f"{cycle['client_id']}.safetensors"
+        if delta.is_file():   # written atomically at the end of the round (this cycle's own client id)
+            return delta
+        training = self.training(req)
         canary = cycle["canary"]
-        inner = int(training.get("canary_steps", 20)) if canary else int(training.get("inner_steps", 500))
+        inner = int(training.get("canary_steps", 20)) if canary else int(training["inner_steps"])
         steps = inner if canary else int(training.get("steps", 10**7))
         out = self.work / ("canary-" + cycle["client_id"] if canary else "trainer")
-        delta = self.work / "outbox" / f"{cycle['client_id']}.safetensors"
         seed = int(cycle["shard"]["recipe"].get("train_seed", 20261014)) if cycle.get("shard") else self.opts.seed
         argv = [*self.launcher(), "-m", "enntity_drafter.train", "--config", str(self.opts.config), "--teacher",
                 str(self.opts.teacher), *cycle["data"], "--output", str(out), "--sync-mode", "diloco",
@@ -419,8 +453,6 @@ class Site:
             if key in training:
                 argv += [f"--{key.replace('_', '-')}", str(kind(training[key]))]
         argv += self.local_trainer_args()
-        if delta.is_file():   # written atomically at the end of the round (this cycle's own client id)
-            return delta
         log = self.work / "logs" / f"train-{cycle['client_id']}.log"
         log.parent.mkdir(parents=True, exist_ok=True)
         with log.open("a") as stream:
@@ -430,8 +462,9 @@ class Site:
                 time.sleep(2)
         self._progress(out / "train.jsonl", inner)
         if proc.returncode or not delta.is_file():
-            raise JoinError(f"training failed (exit {proc.returncode}); see {log}. Rerun `drafter-join run` to "
-                            "resume from the last checkpoint.")
+            again = "drafter-join setup` with the same flags" if canary else "drafter-join run`"
+            raise JoinError(f"training failed (exit {proc.returncode}); see {log}. Fix the cause, then rerun `{again} "
+                            "to resume from the last checkpoint.")
         return delta
 
     def _progress(self, log: Path, inner: int) -> None:
@@ -465,12 +498,18 @@ class Site:
         return [sys.executable]
 
     def _self_check(self, cycle: dict[str, Any], delta: Path, req: dict[str, Any]) -> dict[str, Any]:
-        from .validation import CheckFailed, Thresholds, candidate_weights, check_delta, evaluate, judge, metrics_of
+        """The validator's own checks before upload.  A canary (never merged; a few steps from a fresh optimizer
+        can dip) gets the sanity checks and catastrophic bound the validator gives canaries, never the merge
+        thresholds."""
 
-        base = Path(cycle["base"]["path"])
+        from .validation import (CheckFailed, Thresholds, canary_bounds, candidate_weights, check_delta, evaluate,
+                                 judge, judge_canary, metrics_of)
+
+        base, canary = Path(cycle["base"]["path"]), cycle["canary"]
+        bounds = canary_bounds(req.get("norm_bounds")) if canary else req.get("norm_bounds")
         try:
             stats = check_delta(delta, base, {"base_sha256": cycle["base"]["sha256"], **{
-                k: v for k, v in self.pins().items() if k != "validator_version"}}, req.get("norm_bounds"))
+                k: v for k, v in self.pins().items() if k != "validator_version"}}, bounds)
         except CheckFailed as failure:
             raise self._set_aside(cycle, "failed-checks", f"self-check failed before upload ({failure.code}): "
                                                           f"{failure.message}; nothing was uploaded") from failure
@@ -488,7 +527,7 @@ class Site:
             finally:
                 candidate.unlink(missing_ok=True)
             if base_m is not None:
-                decision, code, message, _ = judge(base_m, cand_m, Thresholds())
+                decision, code, message, _ = (judge_canary if canary else judge)(base_m, cand_m, Thresholds())
                 if decision == "reject":
                     raise self._set_aside(cycle, "failed-checks", f"self-check on the public check set failed "
                                                                   f"({code}): {message}; nothing was uploaded")
@@ -505,6 +544,7 @@ class Site:
             cycle = self.state["cycle"] = self.state["parked"].pop(0)   # a delta that waited for the canary
             self.save()
         if cycle is None:
+            self.training(req)   # before claiming or building anything
             if not req["canary_required"] and req.get("open_deltas", 0) >= req.get("max_open_deltas", 10**9):
                 raise JoinError("waiting: this site's earlier deltas are not merged yet (the coordinator limits "
                                 "unmerged deltas per site)", wait=300)
@@ -517,7 +557,13 @@ class Site:
         if cycle["stage"] == "data":
             self.set_phase("claiming")
             if self.opts.mode == "recipe" and not cycle.get("shard"):
-                shard = self.api.call("POST", "/api/v1/shards/claim")["shard"]
+                try:
+                    shard = self.api.call("POST", "/api/v1/shards/claim")["shard"]
+                except ApiError as error:   # the network is not set up yet: wait, nothing was built
+                    if error.code != "not_ready":
+                        raise
+                    raise JoinError(f"waiting ({error.code}: {error.message})", UPLOAD_ACTIONS["not_ready"][1]) \
+                        from error
                 if shard is None:
                     self.state["cycle"] = None
                     self.save()
@@ -594,7 +640,7 @@ class Site:
                 self.state["cycle"] = None
                 self.save()
                 raise JoinError(f"canary not accepted ({status['state']}: {status.get('reason_code')} "
-                                f"{status.get('reason')}); long rounds were not started")
+                                f"{status.get('reason')}); long rounds were not started. {self.next_step(cycle)}")
             cycle["stage"] = "done"
             self.save()
         self.set_phase("cleaning")
@@ -683,8 +729,17 @@ class Site:
             delta.replace(kept)
         self.state["cycle"] = None
         self.save()
-        return JoinError(f"{why}. The delta is kept at {kept}; the next `drafter-join run` starts a new round "
-                         "(run `drafter-join update` first if the message asks for it).")
+        return JoinError(f"{why}. The delta is kept at {kept}. {self.next_step(cycle)}")
+
+    @staticmethod
+    def next_step(cycle: dict[str, Any]) -> str:
+        """The exact command after a cycle was given up (JOIN.md: `setup` ends with the canary)."""
+
+        if cycle.get("canary"):
+            return ("Fix the cause, then rerun `drafter-join setup` with the same flags: it checks this host again and "
+                    "runs a new canary (run `drafter-join update --yes` first if the message asks for it).")
+        return ("The next `drafter-join run` starts a new round (run `drafter-join update --yes` first if the message "
+                "asks for it).")
 
     def wait_verdict(self, delta_id: str, timeout_s: float) -> dict[str, Any]:
         deadline = time.time() + timeout_s
@@ -739,6 +794,69 @@ class Site:
 # setup (preflight)
 # --------------------------------------------------------------------------
 
+BUILD_FIX = ("install the Python headers and a C compiler (Debian/Ubuntu: sudo apt install python3-dev "
+             "build-essential); or, without root, a uv-managed CPython: pip install uv && uv python install 3.12 && "
+             "\"$(uv python find 3.12)\" -m venv .venv, then redo JOIN.md step 1 in it; or the container in JOIN.md "
+             "step 1")
+TRITON_PROBE = """import torch, triton, triton.language as tl
+
+
+@triton.jit
+def add_one(x, n: tl.constexpr):
+    offsets = tl.arange(0, n)
+    tl.store(x + offsets, tl.load(x + offsets) + 1)
+
+
+x = torch.zeros(16, device="cuda")
+add_one[(1,)](x, 16)
+torch.cuda.synchronize()
+assert float(x.sum()) == 16.0
+"""
+
+
+def build_check(gpu: bool, include: Path | None = None) -> tuple[bool | None, str]:
+    """Triton compiles kernels (and its launcher, against Python.h) at the first compiled GPU step, which the CPU smoke
+    never reaches: check the headers, and on a GPU compile and run a trivial kernel."""
+
+    import sysconfig
+
+    include = Path(include or sysconfig.get_paths()["include"])
+    if not (include / "Python.h").is_file():
+        return (False if gpu else None), f"no Python.h in {include}, so Triton cannot compile GPU kernels; {BUILD_FIX}"
+    if not gpu:
+        return True, f"Python.h in {include} (no GPU: Triton not compiled)"
+    with tempfile.TemporaryDirectory(prefix="drafter-triton-") as tmp:
+        probe = Path(tmp) / "probe.py"   # triton.jit reads the kernel's source file
+        probe.write_text(TRITON_PROBE)
+        try:
+            done = subprocess.run([sys.executable, str(probe)], capture_output=True, text=True, timeout=900)
+        except subprocess.TimeoutExpired:
+            return False, "compiling a trivial Triton kernel took over 15 minutes"
+    if done.returncode:
+        tail = " ".join((done.stderr or done.stdout).strip().splitlines()[-2:])[-300:]
+        return False, f"compiling a trivial Triton kernel failed ({tail}); {BUILD_FIX}"
+    return True, "compiled and ran a trivial Triton kernel"
+
+
+def open_file_check() -> tuple[bool | None, str]:
+    """The capture loader memory-maps segment files (one open file each); a low soft limit fails mid-round."""
+
+    import resource
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+
+    def limit(value: int) -> float:
+        return math.inf if value == resource.RLIM_INFINITY else value
+
+    if limit(soft) >= NOFILE_MIN:
+        return True, f"soft limit {soft}"
+    detail = (f"soft limit {soft} < {NOFILE_MIN}: run `ulimit -n $(ulimit -Hn)` in the shell that runs drafter-join "
+              f"(hard limit {hard})")
+    if limit(hard) < NOFILE_MIN:
+        detail += f"; the hard limit is below {NOFILE_MIN} too: ask the host's admin to raise nofile"
+    return None, detail
+
+
 def preflight(opts: argparse.Namespace) -> list[tuple[str, str, str]]:
     """(check, PASS|WARN|FAIL, detail or fix) for this host."""
 
@@ -760,8 +878,10 @@ def preflight(opts: argparse.Namespace) -> list[tuple[str, str, str]]:
             add("GPU", True, f"{torch.cuda.device_count()} x {props.name}, {props.total_memory / 2**30:.0f} GiB")
         else:
             add("GPU", None, "no CUDA device: training will run on CPU (tests only)")
+        add("Triton build (Python.h, compiler)", *build_check(cuda))
     except ImportError:
         add("torch 2.11-2.12", False, "pip install 'torch>=2.11,<2.13'")
+    add("open-file limit", *open_file_check())
     try:
         import speculators  # noqa: F401
 
@@ -862,7 +982,13 @@ def build_parser() -> argparse.ArgumentParser:
         q.add_argument("--mode", choices=["recipe", "byo"], default="recipe")
         q.add_argument("--byo-features", type=Path, help="byo: your enntity.drafter_rows/v1 store")
         q.add_argument("--byo-capture-index", type=Path, help="byo: your capture index.json")
-        q.add_argument("--byo-capture-root", type=Path)
+        q.add_argument("--byo-capture-root", type=Path, help="byo: the directory capture index paths (and "
+                       "--byo-captures globs) are relative to")
+        q.add_argument("--byo-captures", action="append", default=[], metavar="GLOB",
+                       help="byo: instead of --byo-capture-index, index captures in this repo's format under "
+                            "--byo-capture-root (for example 'fast-*/p*'); repeatable")
+        q.add_argument("--byo-manifest", type=Path, action="append", default=[],
+                       help="byo, with --byo-captures: capture manifest (JSON/JSONL); only rows it lists are indexed")
         q.add_argument("--byo-exclude-ids", type=Path, action="append", default=[],
                        help="byo: JSONL of row ids ({\"id\": ...}) this site must never train or self-check on, for "
                             "example private held-out rows on the same disks; repeatable")
@@ -913,10 +1039,21 @@ def main(argv: list[str] | None = None) -> int:
                 if subprocess.run(cmd, env={**os.environ, "PYTHON": sys.executable}).returncode:
                     raise JoinError(f"`{' '.join(cmd)}` failed")
             return 0
-        if opts.mode == "byo" and not (opts.byo_features or (opts.byo_capture_index and opts.byo_capture_root)):
-            raise JoinError("--mode byo needs --byo-features or --byo-capture-index with --byo-capture-root")
-        if opts.byo_exclude_ids and not opts.byo_capture_index:
-            raise JoinError("--byo-exclude-ids applies to --byo-capture-index")
+        if (opts.byo_captures or opts.byo_manifest) and (opts.byo_capture_index or not opts.byo_captures
+                                                         or not opts.byo_capture_root):
+            raise JoinError("--byo-captures GLOB [--byo-manifest FILE] needs --byo-capture-root and replaces "
+                            "--byo-capture-index")
+        if opts.byo_captures and opts.cmd in ("setup", "run"):
+            from . import model as sm
+
+            opts.byo_capture_index = byo_source_index(opts.byo_capture_root, opts.byo_captures, opts.byo_manifest,
+                                                      Path(opts.work) / "byo-source-index", sm.load_config(opts.config))
+        if opts.mode == "byo" and not (opts.byo_features or (opts.byo_capture_root and (opts.byo_capture_index or
+                                                                                       opts.byo_captures))):
+            raise JoinError("--mode byo needs --byo-features, or --byo-capture-root with --byo-capture-index or "
+                            "--byo-captures")
+        if opts.byo_exclude_ids and not (opts.byo_capture_index or opts.byo_captures):
+            raise JoinError("--byo-exclude-ids applies to --byo-capture-index or --byo-captures")
         if opts.cmd == "setup":
             bad = False
             for check, status, detail in preflight(opts):

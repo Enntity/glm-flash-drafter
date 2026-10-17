@@ -122,17 +122,20 @@ More: [docs/pipeline.md](docs/pipeline.md), [docs/capture.md](docs/capture.md)
   run a memory watchdog that kills the job above a floor; use the trainer's
   `--probe` (worst-case forward/backward before step 0), `--min-free-gb` (clean
   stop on every rank) and `--max-mem-fraction`. Raise the open-file limit for
-  memory-mapped data (`ulimit -n 524288`).
+  memory-mapped data to the host's hard limit, `ulimit -n $(ulimit -Hn)`, in the
+  shell that trains (a fixed value above the hard limit fails; `drafter-join
+  setup` warns when the soft limit is low).
 
 ## How to help
 
-- **Run a volunteer training site** (built, not yet hosted). Sites train the whole drafter on their own data
-  for short rounds and upload only weight deltas; a validator checks each delta on a private held-out set and
-  merges accepted ones by token-weighted plain averaging (DiLoCo with outer learning rate 1, which matched or
-  beat synchronous training in a two-site A/B). Joining is by invite: with a link from the operator, follow
-  [JOIN.md](JOIN.md) (written so a coding agent can execute it). Design, costs per round, trust model and what
-  we promise contributors: [docs/volunteer.md](docs/volunteer.md); running the coordinator and validator:
-  [docs/operators.md](docs/operators.md).
+- **Run a volunteer training site** (live, invite-only pilot). Sites train the whole drafter on their own data for
+  short rounds and upload only weight deltas; a validator checks each delta on a private held-out set and merges
+  accepted ones by token-weighted plain averaging (DiLoCo with outer learning rate 1, which matched or beat
+  synchronous training in a two-site A/B). Joining is by invite: with a link from the operator, follow
+  [JOIN.md](JOIN.md) (written so a coding agent can execute it). The coordinator URL is the part of your invite
+  link before `/join`; its public dashboard (sites, totals, held-out curve) is at that URL. Design, costs per
+  round, trust model and what we promise contributors: [docs/volunteer.md](docs/volunteer.md); running the
+  coordinator and validator: [docs/operators.md](docs/operators.md).
 - **Train on your own data.** A site can bring its own prompts, chat logs or agent traffic: one command
   (`scripts/byo_prepare.py`) checks the teacher rules, generates missing GLM-5.3-Flash completions, captures,
   verifies and prints the `drafter-join` command; the data never leaves the machine. Guide:

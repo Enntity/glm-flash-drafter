@@ -41,6 +41,25 @@ DELTA_META = {"tokens": (float, 0, 1e15), "steps": (int, 1, 10**9), "step_start"
               "step_end": (int, 1, 10**12), "inner_steps": (int, 1, 10**9), "delta_dtype": (str, None, None),
               "trainer": (str, None, None), "config_sha256": (str, None, None),
               "validator_version": (str, None, None), "client": (str, None, None)}
+#: What the operator must publish before the network issues invites or shard leases (and before a site trains): a
+#: site never falls back to the trainer's command-line defaults.  key: required fields of its JSON object.
+REQUIRED_SETTINGS = {"requirements": ("trainer", "config_sha256"), "publish_key": (),
+                     "training": ("lr", "warmup", "min_lr_ratio", "anchors", "grad_accum", "inner_steps")}
+
+
+def missing_settings(values: dict[str, Any], required: dict[str, tuple[str, ...]] = REQUIRED_SETTINGS) -> list[str]:
+    """Names of unset settings (``training``) and unset fields (``training.lr``) among ``required``."""
+
+    missing = []
+    for key, fields in required.items():
+        value = values.get(key)
+        if not value:
+            missing.append(key)
+        else:
+            missing += [f"{key}.{f}" for f in fields if not isinstance(value, dict) or value.get(f) is None]
+    return missing
+
+
 RECEIVED = ("pending", "validating", "accepted", "held", "quarantined", "merged")
 OPEN = ("uploading", "pending", "validating", "accepted")   # unmerged work a site has in flight
 #: What a site is told about a verdict: a code and a fixed explanation, never held-out numbers (no oracle).
@@ -49,6 +68,7 @@ REASONS = {
     "heldout_borderline": "accepted at reduced weight: the private held-out check moved slightly",
     "heldout_regression": "the private held-out check got clearly worse with this delta",
     "heldout_invalid": "the held-out check could not score this delta (non-finite or missing result)",
+    "canary_collapse": "the canary made the private held-out check collapse (far beyond a normal canary dip)",
     "norm_high": "the delta is much larger than typical accepted deltas",
     "norm_low": "the delta is much smaller than typical accepted deltas",
     "zero": "the delta is all zeros",
@@ -116,6 +136,7 @@ class Config:
     merge_canaries: bool = False
     require_canary: bool = True        # a site's first delta (and the first after a pin change) is a short canary
     max_canary_steps: int = 50
+    require_settings: bool = True      # no invites or shard leases until REQUIRED_SETTINGS are published
     max_open_uploads: int = 2          # per site: uploads started and not completed
     max_open_deltas: int = 3           # per site: unmerged non-canary deltas (bounds one site's share of a round)
     upload_ttl_s: float = 24 * 3600.0  # abandoned uploads are aborted after this
@@ -252,7 +273,17 @@ class Service:
         if not token or not stored or not hmac.compare_digest(terms.token_hash(token), stored):
             raise ApiError(401, "auth_invalid", "admin token required")
 
+    def missing_settings(self) -> list[str]:
+        return missing_settings({key: self.get_setting(key) for key in REQUIRED_SETTINGS})
+
+    def _require_settings(self, what: str) -> None:
+        missing = self.missing_settings() if self.config.require_settings else []
+        if missing:
+            raise ApiError(409, "not_ready", f"no {what} until the operator publishes the network settings "
+                                             f"(missing: {', '.join(missing)}; docs/operators.md); try again later")
+
     def issue_invite(self, label: str = "", hours: float | None = None) -> dict[str, Any]:
+        self._require_settings("invites")
         code = "inv_" + secrets.token_urlsafe(18)
         expires = self.now() + 3600 * (hours if hours is not None else self.config.invite_hours)
         with self.tx() as db:
@@ -361,7 +392,7 @@ class Service:
                                                                    "escalated", "updated", "verdict")} for r in rows]
 
     def attention(self) -> dict[str, Any]:
-        """What needs an operator: held deltas, unreviewed quarantines, a pending gate override."""
+        """What needs an operator: held deltas, unreviewed quarantines, a pending gate override, unset settings."""
 
         with contextlib.closing(self._connect()) as db:
             rows = db.execute("SELECT d.id, d.state, d.reason_code, d.updated, d.escalated, s.public_id FROM deltas d "
@@ -369,7 +400,8 @@ class Service:
                               "d.reviewed IS NULL AND d.purged IS NULL) ORDER BY d.updated").fetchall()
             force = self._meta(db, "force_merge")
         return {"needs_review": [dict(r) | {"age_s": self.now() - r["updated"]} for r in rows],
-                "escalated": sum(1 for r in rows if r["escalated"]), "force_merge_pending": force is not None}
+                "escalated": sum(1 for r in rows if r["escalated"]), "force_merge_pending": force is not None,
+                "missing_settings": self.missing_settings()}
 
     def audit_log(self, limit: int = 200) -> list[dict[str, Any]]:
         with contextlib.closing(self._connect()) as db:
@@ -463,6 +495,7 @@ class Service:
             self._audit(db, "shard.lease_expired", "coordinator", row["id"])
 
     def claim_shard(self, site) -> dict[str, Any] | None:
+        self._require_settings("shard leases")
         with self.tx() as db:
             self._expire_leases(db)
             row = db.execute("SELECT * FROM shards WHERE state='leased' AND lease_site=?", (site["id"],)).fetchone()
