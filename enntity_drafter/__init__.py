@@ -8,3 +8,7 @@ conversion), :mod:`.fastpath` (opt-in performance path), :mod:`.train`,
 """
 
 __version__ = "0.1.0"
+
+from ._compat import ensure_datasets_importable as _ensure_datasets_importable
+
+_ensure_datasets_importable()   # speculators imports `datasets` at load; see enntity_drafter._compat
