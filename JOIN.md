@@ -218,6 +218,7 @@ invite link (the part before `/join`, `https://<host>/<path>/`).
 | `self-check failed before upload` | nothing was uploaded; read the code (layout, non_finite, norm_high ...) and report it with the trainer log path it prints; the message ends with the command to run next |
 | `canary not accepted` | fix the cause named in the message, then rerun the same `drafter-join setup` command (it runs a new canary) |
 | `training failed ... see <log>` with `Python.h` or a compiler error | Triton cannot compile: see the prerequisites in step 1, then rerun setup |
+| `training failed ... see <log>` with a `torch._dynamo`, `inductor` or flex-attention error | the compiled fast path failed on your stack: rerun with `--trainer-arg=--attn=sdpa` (the client then leaves the whole fast path to you; about a third of the speed) and report the log |
 | `paused: low memory` | nothing to do: another process took memory; the round is checkpointed and resumes by itself once memory is back (`drafter-join status`; the dashboard shows `paused`). Frequent pauses: see safety rule 2 |
 | `memory stayed below ... for 6 h` | the round is kept; free memory on the host or move the site, then rerun `drafter-join run` |
 | `uses files that are not on this host` | after moving a site: see "Moving the site to another machine" |

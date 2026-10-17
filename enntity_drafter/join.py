@@ -57,8 +57,13 @@ TRAINING_KEYS = {"lr": float, "warmup": int, "min_lr_ratio": float, "anchors": i
 #: CUDA sites, unless given locally: stop below 12 GiB free, but by pausing (checkpoint, exit, resume here once
 #: memory is back) rather than dying; the probe keeps 4 GiB more for memory other jobs on the host take and give back.
 MEMORY_GUARDS = ("--min-free-gb", "12", "--probe-headroom-gb", "4", "--low-memory", "pause")
+#: CUDA sites, unless the site picks its own ``--attn``: the measured performance path (docs/training.md; ~3x the
+#: eager default, same math within kernel noise, less memory: compiled flex attention never materialises the scores).
+FAST_PATH = ("--attn", "flex_compiled", "--param-dtype", "bf16", "--compile-layers", "--adamw-impl", "fused",
+             "--deferred-metrics", "--train-metrics", "light", "--pin-loader", "--fp8-device")
 RESUME_STEADY_S = 60    # a paused round resumes once memory stayed above its floor + headroom this long
 PAUSE_MAX_H = 6.0       # ... and gives up (round kept, checkpointed) after this long without memory
+STOP_WAIT_S = 600       # a stopped trainer finishes its step and saves a checkpoint (tens of GB) before exiting
 FINAL = ("accepted", "merged", "quarantined")
 CHECK_FRACTION = 0.05   # rows of a shard kept out of training as the public self-check set
 CHECK_ROWS_MAX = 64     # ... at most this many rows of a large bring-your-own index
@@ -484,10 +489,10 @@ class Site:
                     while proc.poll() is None:
                         self._progress(out / "train.jsonl", inner)
                         time.sleep(2)
-                except BaseException:   # stopped (Ctrl-C, SIGTERM): the trainer stops too; its checkpoint resumes
+                except BaseException:   # stopped (Ctrl-C, SIGTERM): the trainer checkpoints its last step and exits
                     proc.terminate()
                     try:
-                        proc.wait(60)
+                        proc.wait(STOP_WAIT_S)
                     except subprocess.TimeoutExpired:
                         proc.kill()
                     raise
@@ -519,14 +524,17 @@ class Site:
                   f"- loss {train.get('loss', 0):.4f}   ", end="", flush=True)
 
     def local_trainer_args(self) -> list[str]:
-        """The site's own flags, plus memory guards on CUDA unless given: GB10 CPU and GPU share memory and
-        exhausting it can hang the host, so stop cleanly below 12 GiB free, and probe the worst case at every start
-        and resume (memory shared with other services changes; the probe also sizes the micro-batch)."""
+        """The site's own flags (they come last, so they win), plus on CUDA: the fast path unless the site sets
+        ``--attn``, and memory guards unless given. GB10 CPU and GPU share memory and exhausting it can hang the
+        host, so stop cleanly below 12 GiB free, and probe the worst case at every start and resume (memory shared
+        with other services changes; the probe also sizes the micro-batch)."""
 
         local = list(self.opts.trainer_arg)
         import torch
 
         if torch.cuda.is_available():
+            if not any(a.split("=")[0] == "--attn" for a in local):
+                local = [*FAST_PATH, *local]
             for flag, value in zip(MEMORY_GUARDS[::2], MEMORY_GUARDS[1::2]):
                 if not any(a.split("=")[0] == flag for a in local):
                     local += [flag, value]

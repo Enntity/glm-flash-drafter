@@ -18,9 +18,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -396,6 +398,33 @@ class TrainingTests(unittest.TestCase, Fixture):
         self.assertEqual((paused / "checkpoints" / "latest-rank0").read_text(), "step-0000002")
         self.run_cmd(self.train_cmd(paused, *common, ranks=1))   # memory is back
         self.assertTrue(all(torch.equal(v, params(reference)[k]) for k, v in params(paused).items()))
+
+    def test_sigterm_checkpoints_the_last_step_and_resumes_exactly(self):   # dogfood: a stop lost 25 steps
+        """SIGTERM (drafter-join stopping, a closed shell) finishes the running step, checkpoints it and exits 143;
+        rerunning resumes and matches an undisturbed run."""
+
+        def params(output: Path) -> dict[str, torch.Tensor]:
+            return guarded_torch_load(output / "checkpoints" / "step-0000006" / "rank0.pt", "drafter")["params"]
+
+        common = ("--steps", "6", "--eval-every", "0", "--checkpoint-every", "100", "--log-every", "1")
+        reference, stopped = self.root / "sigterm-ref", self.root / "sigterm-run"
+        self.run_cmd(self.train_cmd(reference, *common, ranks=1))
+        env = {**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"}
+        proc = subprocess.Popen(self.train_cmd(stopped, *common, ranks=1), cwd=REPO, env=env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        log, deadline = stopped / "train.jsonl", time.monotonic() + 600
+        while not (log.is_file() and '"phase": "train", "step": 1,' in log.read_text()):
+            self.assertIsNone(proc.poll(), "the trainer exited before its first step")
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.05)
+        proc.send_signal(signal.SIGTERM)
+        self.assertEqual(proc.wait(600), 143, proc.stderr.read()[-2000:])
+        last = json.loads(log.read_text().splitlines()[-1])
+        self.assertEqual((last["phase"], last["reason"]), ("stop", "signal"))
+        self.assertLess(last["step"], 6)
+        self.assertEqual((stopped / "checkpoints" / "latest-rank0").read_text(), f"step-{last['step']:07d}")
+        self.run_cmd(self.train_cmd(stopped, *common, ranks=1))
+        self.assertTrue(all(torch.equal(v, params(reference)[k]) for k, v in params(stopped).items()))
 
     def test_checkpoint_leaves_no_host_copies_behind(self):   # dogfood: host memory 11 -> 32 GB after a checkpoint
         script = """

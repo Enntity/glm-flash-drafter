@@ -976,11 +976,15 @@ class Service:
     def _site_stats(self, db) -> dict[int, dict[str, Any]]:
         stats: dict[int, dict[str, Any]] = {}
         marks = ",".join("?" * len(RECEIVED))
-        for row in db.execute(f"SELECT site_id, state, canary, meta FROM deltas WHERE state IN ({marks})", RECEIVED):
-            entry = stats.setdefault(row["site_id"], {"tokens_received": 0.0, "deltas_received": 0,
-                                                      "deltas_accepted": 0, "deltas_pending": 0,
-                                                      "deltas_quarantined": 0})
-            entry["tokens_received"] += float(json.loads(row["meta"]).get("tokens") or 0.0)
+        day_start = self.now() - 86400
+        for row in db.execute(f"SELECT site_id, state, canary, meta, received FROM deltas WHERE state IN ({marks})",
+                              RECEIVED):
+            entry = stats.setdefault(row["site_id"], {"tokens_received": 0.0, "tokens_last_day": 0.0,
+                                                      "deltas_received": 0, "deltas_accepted": 0,
+                                                      "deltas_pending": 0, "deltas_quarantined": 0})
+            tokens = float(json.loads(row["meta"]).get("tokens") or 0.0)
+            entry["tokens_received"] += tokens
+            entry["tokens_last_day"] += tokens if (row["received"] or 0) > day_start else 0.0
             entry["deltas_received"] += 1
             entry["deltas_accepted"] += row["state"] in ("accepted", "merged")
             entry["deltas_pending"] += row["state"] in ("pending", "validating", "held")
@@ -1004,13 +1008,14 @@ class Service:
         with contextlib.closing(self._connect()) as db:
             current = self._current(db)
             stats = self._site_stats(db)
-            sites, online = [], 0
+            sites, online, tokens_day = [], 0, 0.0
             for row in db.execute("SELECT * FROM sites WHERE role='site' AND revoked IS NULL"):
                 beat = json.loads(row["heartbeat"] or "{}")
                 status = self.site_status(beat, row["last_seen"], now)
                 live = status not in ("offline", "stale", "stopped")
                 online += live
                 entry = stats.get(row["id"], {})
+                tokens_day += entry.get("tokens_last_day", 0.0)
                 sites.append({"name": row["display_name"] or "anonymous", "anonymous": row["display_name"] is None,
                               "status": status,
                               "tokens_per_s": beat.get("tokens_per_s") if live else None,
@@ -1020,10 +1025,6 @@ class Service:
                               "deltas_accepted": entry.get("deltas_accepted", 0),
                               "deltas_pending": entry.get("deltas_pending", 0)})
             sites.sort(key=lambda s: (-s["tokens_received"], s["name"]))
-            day = {}
-            for row in db.execute("SELECT site_id, MIN(tokens) AS lo, MAX(tokens) AS hi FROM heartbeats WHERE ts > ? "
-                                  "GROUP BY site_id", (now - 86400,)):
-                day[row["site_id"]] = max(0.0, (row["hi"] or 0) - (row["lo"] or 0))
             gpu_hours = 0.0
             last: dict[int, float] = {}
             for row in db.execute("SELECT site_id, ts, gpus FROM heartbeats WHERE ts > ? ORDER BY ts", (now - 86400,)):
@@ -1051,7 +1052,7 @@ class Service:
                            "tokens_received": sum(s["tokens_received"] for s in sites),
                            "deltas_received": sum(s["deltas_received"] for s in sites),
                            "deltas_accepted": sum(s["deltas_accepted"] for s in sites),
-                           "tokens_per_day": sum(day.values()), "gpu_hours_per_day": round(gpu_hours, 2)},
+                           "tokens_per_day": tokens_day, "gpu_hours_per_day": round(gpu_hours, 2)},
                 "sites": sites, "curve": curve,
                 "wanted": {"weakest": [{"category": k, "eal": v} for v, k in weakest],
                            "notes": self._meta(db, "wanted_notes", [])},

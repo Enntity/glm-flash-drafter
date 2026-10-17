@@ -263,6 +263,11 @@ def compile_layers(model: nn.Module, mode: str | None = None) -> None:
     # 512 anchors x 8 = 4096 block queries == hidden_size: duck shaping would tie the query length
     # to the (static) hidden size and specialise the first graph on it.
     torch.fx.experimental._config.use_duck_shape = False
+    # torch 2.12's mix-order reductions cannot split the layers' dynamic block-query ranges (InductorError
+    # CantSplit: 8*s50 + 8*s59 not divisible by s50 + s59, on the first real-data step); off, 2.12 runs as 2.11 did.
+    import torch._inductor.config
+
+    torch._inductor.config.triton.mix_order_reduction = False
     unwrap_upstream_forward()
     for layer in model.layers:
         layer.compile(dynamic=True, mode=mode)

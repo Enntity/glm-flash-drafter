@@ -42,6 +42,7 @@ import math
 import os
 import random
 import shutil
+import signal
 import sys
 import time
 from pathlib import Path
@@ -349,6 +350,27 @@ def memory_consensus(device: torch.device, world: int) -> tuple[float, float]:
 
 
 PAUSE_EXIT = 75   # EX_TEMPFAIL: --low-memory pause saved a checkpoint; rerun the same command once memory is back
+STOP_EXIT = 143   # 128 + SIGTERM: stopped by a signal after checkpointing the last completed step
+_stop = {"requested": False}
+
+
+def request_stop(number: int, frame) -> None:
+    """SIGTERM / SIGINT: finish the running step, checkpoint it and exit; a second signal stops at once (the last
+    checkpoint is then the resume point)."""
+
+    if _stop["requested"]:
+        raise KeyboardInterrupt
+    _stop["requested"] = True
+
+
+def stop_consensus(device: torch.device, world: int) -> bool:
+    """True once any rank was asked to stop; one tiny collective."""
+
+    if world == 1:
+        return _stop["requested"]
+    flag = torch.tensor([float(_stop["requested"])], device=device)
+    dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+    return bool(flag.item())
 
 
 def abort_run(emit, record: dict[str, Any], world: int, code: int = 3) -> None:
@@ -1399,6 +1421,8 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
             checkpoint(completed)
         abort_run(lambda r: emit({**r, "phase": "pause"}), record, world, PAUSE_EXIT)
 
+    for name in ("SIGTERM", "SIGINT"):
+        signal.signal(getattr(signal, name), request_stop)
     step = start_step
     while step < args.steps:
         if args.perf_profile and step == start_step + args.perf_warmup:
@@ -1663,7 +1687,8 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
             barrier(world)
         if round_end:
             round_start_tokens = tokens_seen
-        if completed % args.checkpoint_every == 0 or completed == args.steps or (round_end and external):
+        saved = completed % args.checkpoint_every == 0 or completed == args.steps or (round_end and external)
+        if saved:
             checkpoint(completed)
         if round_end and external:
             break   # one round per run: the coordinator merges, the next run starts from its weights
@@ -1672,6 +1697,11 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
             if world > 1:
                 dist.destroy_process_group()
             return {"stopped_at": completed}
+        if stop_consensus(device, world):   # asked to stop: keep the finished step
+            if not saved:
+                checkpoint(completed)
+            abort_run(lambda r: emit({**r, "phase": "stop"}), {"reason": "signal", "step": completed}, world,
+                      STOP_EXIT)
 
     del samples
     power.close()

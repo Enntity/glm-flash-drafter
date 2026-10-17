@@ -78,6 +78,8 @@ the token holder can make it and the coordinator can check it. It is a commitmen
   (branch `exp/drafter-capture-20261014`, [capture.md](capture.md)).
 - Memory safety on GB10 (CPU and GPU share memory): never run the target server and the trainer on the same node;
   the client adds the trainer's `--min-free-gb 12 --probe` guards on CUDA unless you set your own.
+- Speed: on CUDA the client runs the trainer's measured fast path (compiled flex attention, bf16 weights, fused
+  AdamW; "Performance" in [training.md](training.md)) unless you pass your own `--attn`.
 
 ## What a site spends per round
 

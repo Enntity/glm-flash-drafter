@@ -437,6 +437,24 @@ class ClientTests(unittest.TestCase):
             with self.assertRaises(join.JoinError):   # a resumed cycle cannot reach the trainer either
                 site._trainer({"client_id": "c2", "canary": False, "data": []}, {"training": {"lr": 1e-4}})
 
+    def test_cuda_sites_train_on_the_fast_path(self):   # dogfood: volunteers ran eager attention at ~1/3 the speed
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            site = self.site(tmp, None)
+            for cuda, local, expect in ((True, [], True), (False, [], False), (True, ["--attn=sdpa"], False)):
+                site.opts.trainer_arg = local
+                with mock.patch("torch.cuda.is_available", return_value=cuda):
+                    argv = site.local_trainer_args()
+                fast = [a for a in join.FAST_PATH if a.startswith("--")]
+                self.assertEqual(all(f in argv for f in fast), expect, (cuda, local))
+                if not expect:   # a site's own --attn (or no GPU) keeps the whole path its own
+                    self.assertFalse(any(f in argv for f in fast), (cuda, local))
+            site.opts.trainer_arg = []
+            with mock.patch("torch.cuda.is_available", return_value=True):
+                argv = site.local_trainer_args()
+            self.assertEqual(argv[argv.index("--attn") + 1], "flex_compiled")
+
     def test_global_batch_probe_guards_and_override_warning(self):   # dogfood: anchors 512 on a shared GB10
         import contextlib
         import io

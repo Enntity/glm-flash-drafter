@@ -376,7 +376,9 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(names["anonymous"]["anonymous"], True)
         self.assertEqual(names["anonymous"]["tokens_received"], 1000.0)   # credited on receipt
         self.assertEqual(names["Lab one"]["status"], "training")
-        self.assertEqual(data["totals"]["tokens_per_day"], 30000.0)
+        # from deltas received in the last day, as tokens_received (dogfood: heartbeat counters showed 0 after
+        # an accepted canary); the heartbeats' self-reported 30,000 tokens count for nothing
+        self.assertEqual(data["totals"]["tokens_per_day"], 1000.0)
         self.assertEqual(data["totals"]["sites_online"], 1)
         self.assertEqual(data["global"]["version"], 0)
         self.assertEqual(data["wanted"]["weakest"][0]["category"], "heldout")   # groups only, no categories
