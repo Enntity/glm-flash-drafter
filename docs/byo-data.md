@@ -69,25 +69,27 @@ Every command below runs from the repository root.
        --before-capture './start-atlas-capture.sh' --after-capture './stop-atlas.sh'
    ```
 
-   Expected output (counts and timings are illustrative):
+   The output has one line per stage (placeholders in angle brackets; your counts depend on your data):
 
    ```
-   [byo] validate: 7 records -> 7 prompts, 1 reused GLM-5.3-Flash completions, 6 prompts without one
-   [byo] generate: 6 prompts x1 -> http://<glm-host>:8000/v1/chat/completions (spend cap $10 per run)
-       issue stopped (schedule_exhausted) after 0s: issued 6
-   [byo] generate: 6/6 prompts now have completions
-   [byo] items: 7 sequences, 21,410 tokens (locally rendered)
-   [byo] capture: 7 of 7 sequences to capture
-       byo-a21a59ff886b_s0 T=2871 from=0 1903 tok/s
-       ...
-       collected 7 of 7 rows; bad: []
-   [byo] check: alignment: 7 rows kept, 0 rejected; sampled 7: 7/7 tile [from, T) with the capture records
-   [byo] check: agreement: 84.12% over 16,822 generated positions (genuine GLM-5.3-Flash text at T=1: about 83-86%)
-   [byo] index: 7 rows, 20,103 stored tokens, 16,410 eligible anchors, 0.49 GB
+   [byo] validate: <records> records -> <prompts> prompts, <reused> reused GLM-5.3-Flash completions, <missing> prompts without one
+   [byo] generate: <missing> prompts x1 -> <teacher-url> (spend cap $10 per run)
+   [byo] generate: <missing>/<missing> prompts now have completions
+   [byo] items: <sequences> sequences, <tokens> tokens (locally rendered)
+   [byo] capture: <n> of <n> sequences to capture
+       <row-name> T=<len> from=<start> <rate> tok/s
+       collected <n> of <n> rows; bad: []
+   [byo] check: alignment: <n> rows kept, 0 rejected; sampled <k>: <k>/<k> tile [from, T) with the capture records
+   [byo] check: agreement: <pct>% over <positions> generated positions (genuine GLM-5.3-Flash text at T=1: about 83-86%)
+   [byo] index: <rows> rows, <stored> stored tokens, <anchors> eligible anchors, <gb> GB
    [byo] ready. First time on this site, then every round:
-       drafter-join setup --teacher /models/GLM-5.3-Flash --mode byo --byo-capture-index /abs/data/byo/index/index.json --byo-capture-root /abs/data/byo
-       drafter-join run --teacher /models/GLM-5.3-Flash --mode byo --byo-capture-index /abs/data/byo/index/index.json --byo-capture-root /abs/data/byo
+       drafter-join setup --teacher /models/GLM-5.3-Flash --mode byo --byo-capture-index <abs>/index/index.json --byo-capture-root <abs>
+       drafter-join run   --teacher /models/GLM-5.3-Flash --mode byo --byo-capture-index <abs>/index/index.json --byo-capture-root <abs>
    ```
+
+   The one number to check is agreement: well below the 83-86% band means the completions are not
+   GLM-5.3-Flash output (fix that before training). Measured throughput on GB10 hardware is in
+   [docs/results.md](results.md).
 
 3. Run the two printed commands (JOIN.md steps 4-6) on a node that is not serving GLM-5.3-Flash.
 
