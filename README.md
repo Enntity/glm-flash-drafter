@@ -133,6 +133,10 @@ More: [docs/pipeline.md](docs/pipeline.md), [docs/capture.md](docs/capture.md)
   [JOIN.md](JOIN.md) (written so a coding agent can execute it). Design, costs per round, trust model and what
   we promise contributors: [docs/volunteer.md](docs/volunteer.md); running the coordinator and validator:
   [docs/operators.md](docs/operators.md).
+- **Train on your own data.** A site can bring its own prompts, chat logs or agent traffic: one command
+  (`scripts/byo_prepare.py`) checks the teacher rules, generates missing GLM-5.3-Flash completions, captures,
+  verifies and prints the `drafter-join` command; the data never leaves the machine. Guide:
+  [docs/byo-data.md](docs/byo-data.md).
 - **Generate data.** Run the prompt builders and `api_generate.py` with your own key. Better, more diverse prompt
   builders (especially prose, where the drafter is weakest) are the most useful code contribution today.
 - **Run capture and training locally**, on one or two GB10-class machines with your own GLM-5.3-Flash copy. The

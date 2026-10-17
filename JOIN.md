@@ -57,6 +57,12 @@ name, id or prompt id is listed in a `--byo-exclude-ids FILE` (JSONL `{"id": ...
 evaluated, for example an operator's private held-out rows that sit on the same disks. The run log prints how many
 rows were kept and dropped.
 
+**Starting from raw data** (your own prompts, chat logs, agent traffic or GLM-5.3-Flash logs) rather than
+captures: follow [docs/byo-data.md](docs/byo-data.md). `python scripts/byo_prepare.py --input FILE --work DIR
+--teacher <GLM dir> ...` validates the input against the teacher rules (completions must be GLM-5.3-Flash output),
+generates missing completions, captures with the Atlas capture build, checks token alignment and GLM agreement, builds
+the capture index and prints the exact `drafter-join` command. Start with `--dry-run`.
+
 Recipe mode also needs: `--teacher DIR` (your GLM-5.3-Flash, for example `nvidia/GLM-5.3-Flash-NVFP4`),
 `--tokenizer-dir DIR` (the same directory), an OpenAI-compatible GLM-5.3-Flash endpoint (`--teacher-url URL`, or an
 `OPENROUTER_API_KEY` in the environment), the Atlas capture server (`--atlas-server URL`, `--capture-dir DIR` per

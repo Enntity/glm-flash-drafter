@@ -27,8 +27,10 @@ host error text returned as content, empty answers).
 
 Key: ``OPENROUTER_API_KEY`` (or ``--key-env``) from the environment; never printed or written.  ``--url`` and
 ``--model`` point at another OpenAI-compatible GLM-5.3-Flash endpoint (for example your own server); the
-OpenRouter-only fields (provider routing, usage accounting, reasoning switch, key usage check) are then not sent
-and thinking is left at the server's default.
+OpenRouter-only fields (provider routing, usage accounting, reasoning switch, key usage check) are then not sent;
+a row's ``reasoning_effort`` goes as ``reasoning_effort`` and ``chat_template_kwargs`` (as scripts/capture.py renders
+it), otherwise thinking is left at the server's default.  Thinking is read from ``reasoning`` or
+``reasoning_content``.
 Output: ``<out>/generations.jsonl`` and ``<out>/gen-summary.json``.
 
     python scripts/api_generate.py --prompts data/prompts/templates/train.jsonl --out data/gen/templates \
@@ -79,6 +81,9 @@ def body_for(row, max_tokens):
     if URL == OPENROUTER_URL:
         b.update(usage={"include": True}, provider={**PROVIDER, **(row.get("provider_extra") or {})},
                  reasoning={"effort": row["reasoning_effort"]} if row.get("reasoning_effort") else {"enabled": True})
+    elif row.get("reasoning_effort"):   # own server: the chat template's switch, as scripts/capture.py renders it
+        effort = row["reasoning_effort"]
+        b.update(reasoning_effort=effort, chat_template_kwargs={"reasoning_effort": effort})
     if row.get("tools"):
         b["tools"] = row["tools"]
     for k in ("tool_choice", "response_format"):
@@ -150,6 +155,7 @@ def build_schedule(rows, pairs_frac, seed, samples=None):
 
 
 def main():
+    global ALLOWED_SOURCES, URL, MODEL
     ap = argparse.ArgumentParser()
     ap.add_argument("--prompts", required=True, help="prompt rows (jsonl)")
     ap.add_argument("--out", required=True, help="output directory")
@@ -172,7 +178,6 @@ def main():
     ap.add_argument("--model", default=MODEL, help="model name at --url")
     ap.add_argument("--key-env", default="OPENROUTER_API_KEY", help="environment variable holding the API key")
     a = ap.parse_args()
-    global ALLOWED_SOURCES, URL, MODEL
     ALLOWED_SOURCES = set(a.sources.split(","))
     URL, MODEL = a.url, a.model
     effort = dict(kv.split("=", 1) for kv in a.effort.split(",") if kv)
@@ -219,7 +224,8 @@ def main():
                            native_finish=ch.get("native_finish_reason"), wall_s=round(time.time() - ts, 2),
                            prompt_tokens=usage.get("prompt_tokens"), completion_tokens=usage.get("completion_tokens"),
                            reasoning_tokens=(usage.get("completion_tokens_details") or {}).get("reasoning_tokens"),
-                           cost=usage.get("cost") or 0.0, reasoning=msg.get("reasoning") or "",
+                           cost=usage.get("cost") or 0.0,
+                           reasoning=msg.get("reasoning") or msg.get("reasoning_content") or "",
                            content=msg.get("content") or "", tool_calls=msg.get("tool_calls"))
                 rec["junk"] = classify(rec)
             except urllib.error.HTTPError as e:
