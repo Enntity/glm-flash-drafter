@@ -186,12 +186,23 @@ def synthetic_store(cfg: dict[str, Any], recipe: dict[str, Any], out: Path) -> l
     return ["--features", str(out)]
 
 
+def _row_keys(row: dict[str, Any]) -> set[str]:
+    """Names a row can be listed under: its name, id and prompt id, and name and id without a sample suffix
+    (``#s1``, ``_s1``) for indexes that predate stored prompt ids."""
+
+    from .capture_io import _norm_name
+
+    keys = {_norm_name(str(row[k])) for k in ("name", "id", "prompt_id") if row.get(k) is not None}
+    return keys | {re.sub(r"_s\d+$", "", k) for k in keys}
+
+
 def byo_capture_index(index_path: Path, out: Path, exclude: list[Path] = ()) -> list[str]:
     """Bring-your-own capture index -> the site's own index under ``out`` (the capture files are read in place).
 
     Rows the source index does not mark ``train`` (its own held-out, pilot rows) and rows whose name, id or prompt id
-    is listed in an ``exclude`` file (JSONL ``{"id": ...}``, for example an operator's private held-out ids that
-    live on the same disks) are dropped: the site never trains or self-checks on them.  The public check split is
+    (:func:`_row_keys`) is listed in an ``exclude`` file (JSONL ``{"id": ...}``, for example an operator's private
+    held-out prompt ids on the same disks) are dropped: the site never trains or self-checks on them.  The public
+    check split is
     re-carved from the remaining rows by the same hash rule as recipe shards, at most ``CHECK_ROWS_MAX`` rows.
     Returns trainer data args (``--capture-index``; the caller adds ``--capture-root``)."""
 
@@ -207,7 +218,7 @@ def byo_capture_index(index_path: Path, out: Path, exclude: list[Path] = ()) -> 
     for row in index["rows"]:
         if row.get("split") != "train":
             dropped["not_train"] += 1
-        elif excluded & {_norm_name(str(row.get(k))) for k in ("name", "id", "prompt_id") if row.get(k) is not None}:
+        elif excluded & _row_keys(row):
             dropped["excluded"] += 1
         else:
             keep.append({k: v for k, v in row.items() if k != "rank"})
@@ -285,7 +296,7 @@ def pipeline_store(recipe: dict[str, Any], out: Path, opts: argparse.Namespace, 
     stop.touch()
     _run([py, "-m", "enntity_drafter.fp8", "watch", "--root", str(out / "rows"), "--log", str(out / "fp8-log.jsonl"),
           "--stop-file", str(stop)], log)
-    _run([py, "-m", "enntity_drafter.capture_io", "index", "--data-root", str(out), "--fast", "rows/*", "--meta",
+    _run([py, "-m", "enntity_drafter.capture_io", "index", "--data-root", str(out), "--fast", "rows", "--meta",
           str(out / "capture-logs" / "capture-records.jsonl"), "--heldout", str(out / "check-ids.jsonl"),
           "--out", str(out / "index")], log)
     return ["--capture-index", str(out / "index" / "index.json"), "--capture-root", str(out)]

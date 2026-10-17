@@ -663,6 +663,50 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertIn('"cryptography>=42,<47"', dockerfile)
 
 
+class GcsUploadTests(unittest.TestCase):
+    def test_resumable_upload_survives_more_blips_than_retries(self):
+        """A 2.3 GB global is ~35 GCS chunks: transient connection resets are counted per chunk, not per file
+        (the dogfood's first publish of version 0 failed on its 7th reset over the whole upload)."""
+
+        from unittest import mock
+
+        from coordinator import client
+
+        data = os.urandom(20 * 1024 + 100)
+        received, calls = bytearray(), {"n": 0}
+
+        def fake_put(url, chunk, headers=None, timeout=600):
+            span = headers["Content-Range"].split()[1]
+            if span.startswith("*"):   # status query
+                return 308, ({"Range": f"bytes=0-{len(received) - 1}"} if received else {})
+            calls["n"] += 1
+            if calls["n"] % 2 == 0:
+                raise urllib.error.URLError("EOF occurred in violation of protocol")
+            start = int(span.split("-")[0])
+            del received[start:]
+            received.extend(chunk)
+            return (200, {}) if len(received) == len(data) else (308, {"Range": f"bytes=0-{len(received) - 1}"})
+
+        class Session:
+            headers = {"Location": "https://storage.example/session"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(client, "_put", fake_put), \
+                mock.patch.object(client.urllib.request, "urlopen", lambda *a, **k: Session()):
+            path = Path(tmp) / "blob"
+            path.write_bytes(data)
+            plan = {"protocol": "gcs-resumable", "chunk_size": 1024, "init_url": "https://storage.example/init",
+                    "init_headers": {}}
+            self.assertEqual(upload_file(path, plan, lambda n: plan, {}, retries=2, sleep=lambda s: None), [])
+        self.assertEqual(bytes(received), data)
+        self.assertGreater(calls["n"] // 2, 2)   # more resets than retries, never two in a row
+
+
 class ControlPlaneTests(unittest.TestCase):
     def test_coordinator_never_loads_weights(self):
         import re

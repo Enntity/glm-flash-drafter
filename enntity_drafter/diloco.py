@@ -45,7 +45,6 @@ import contextlib
 import hashlib
 import json
 import math
-import os
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -182,13 +181,18 @@ def decode_named(tensors: dict[str, torch.Tensor], shapes: dict[str, tuple[int, 
 
 
 def _save(path: Path, tensors: dict[str, torch.Tensor], metadata: dict[str, str]) -> None:
-    from safetensors.torch import save_file
+    """Write a safetensors file whose bytes depend only on the tensors and metadata (sorted names and keys, written
+    by ``validation.StreamWriter``, atomically).  safetensors' own writer orders metadata keys at random, so writing
+    the same weights twice gave two SHA-256s (a rerun of ``validator init`` then started a second upload)."""
 
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    save_file({k: v.detach().cpu().contiguous() for k, v in tensors.items()}, str(temporary), metadata=metadata)
-    os.replace(temporary, path)
+    from .validation import StreamWriter
+
+    items = {k: tensors[k].detach().cpu().contiguous() for k in sorted(tensors)}
+    writer = StreamWriter(Path(path), [(k, v.dtype, tuple(v.shape)) for k, v in items.items()],
+                          dict(sorted(metadata.items())))
+    for name, value in items.items():
+        writer.write(name, value)
+    writer.close()
 
 
 def save_weights(path: str | Path, tensors: dict[str, torch.Tensor], dtype: str, stamp: dict[str, Any],

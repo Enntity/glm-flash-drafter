@@ -418,7 +418,7 @@ def build_index(data_root: Path, pilot: list[str], fast: list[str], meta_paths: 
         if fmt == "fast":
             nbytes += sum((data_root / s[0]).stat().st_size for s in scan["final_segs"])
         seen[name] = {
-            "name": name, "id": info.get("id", name), "format": fmt, "dir": rel, "lo": lo, "hi": hi, "P": P,
+            "name": name, "id": info.get("id", name), "prompt_id": info.get("prompt_id"), "format": fmt, "dir": rel, "lo": lo, "hi": hi, "P": P,
             "a_min": a_min, "a_max": a_max, "anchors": anchors, "split": split,
             "source": info.get("source"), "kind": info.get("kind"), "category": info.get("category"),
             "on_policy": info.get("on_policy"), "tok_off": token_offset, "bytes": nbytes,

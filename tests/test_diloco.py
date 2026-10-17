@@ -102,6 +102,9 @@ class CodecTests(unittest.TestCase):
             tensors, meta = dl.load_weights(Path(tmp) / "w.safetensors")
             self.assertEqual((meta["version"], meta["dtype"], len(sha)), (3, "bf16", 64))
             self.assertEqual(tensors["b"].dtype, torch.float32)
+            again = {dl.save_weights(Path(tmp) / f"w{k}.safetensors", dict(reversed(deltas.items())), "bf16",
+                                     scratch_stamp(), {"version": 3}) for k in range(8)}
+            self.assertEqual(again, {sha})   # same weights, same bytes (a rerun reuses its upload)
 
 
 class OuterStepTests(unittest.TestCase):

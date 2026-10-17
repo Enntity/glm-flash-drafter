@@ -85,6 +85,14 @@ def _read(path: Path, offset: int, length: int) -> bytes:
         return stream.read(length)
 
 
+def _gcs_next(headers: dict[str, str]) -> int:
+    """Next byte to send after a GCS 308: ``Range: bytes=0-N`` means N+1 bytes are stored; no Range header means
+    none are."""
+
+    stored = headers.get("Range") or headers.get("range")
+    return int(stored.rsplit("-", 1)[1]) + 1 if stored else 0
+
+
 def upload_file(path: str | Path, plan: dict[str, Any], refresh: Callable[[list[int]], dict[str, Any]],
                 state: dict[str, Any], save: Callable[[], None] = lambda: None, retries: int = 6,
                 sleep: Callable[[float], None] = time.sleep, before_part: Callable[[int], None] | None = None,
@@ -127,7 +135,8 @@ def upload_file(path: str | Path, plan: dict[str, Any], refresh: Callable[[list[
     if plan["protocol"] != "gcs-resumable":
         raise ValueError(f"unknown upload protocol {plan['protocol']!r}")
     chunk = plan["chunk_size"]
-    for attempt in range(retries + 1):
+    attempt = 0   # consecutive failures: reset whenever a chunk is acknowledged, so a long upload survives blips
+    while True:
         try:
             if state.get("done"):
                 return []
@@ -146,8 +155,8 @@ def upload_file(path: str | Path, plan: dict[str, Any], refresh: Callable[[list[
             if status == 404 or status == 410:   # session gone: start over
                 state.pop("session", None)
                 plan = {}
-                continue
-            offset = int(headers.get("Range", "bytes=0--1").split("-")[-1]) + 1 if status == 308 else 0
+                raise ApiError(status, "upload_failed", "upload session expired")
+            offset = _gcs_next(headers) if status == 308 else 0
             while offset < size:
                 if before_part is not None:
                     before_part(offset // chunk + 1)
@@ -160,14 +169,15 @@ def upload_file(path: str | Path, plan: dict[str, Any], refresh: Callable[[list[
                     return []
                 if status != 308:
                     raise ApiError(status, "upload_failed", f"chunk at {offset} answered HTTP {status}")
-                offset = int(headers.get("Range", f"bytes=0-{end}").split("-")[-1]) + 1
+                offset = _gcs_next(headers)
+                attempt = 0
                 if progress:
                     progress(offset, size)
         except (urllib.error.URLError, ConnectionError, TimeoutError, OSError, ApiError):
             if attempt == retries:
                 raise
             sleep(_backoff(attempt))
-    raise ApiError(0, "upload_failed", "GCS upload did not finish")
+            attempt += 1
 
 
 def sha256_file(path: str | Path) -> str:

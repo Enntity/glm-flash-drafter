@@ -792,10 +792,15 @@ class CaptureTrainingTests(unittest.TestCase, CaptureFixture):
 
         source = json.loads((self.root / "index" / "index.json").read_text())
         train = [r["name"] for r in source["rows"] if r["split"] == "train"]
+        for k, row in enumerate(r for r in source["rows"] if r["split"] == "train"):
+            row["prompt_id"] = f"prompt-{k}" if k == 1 else None   # a regenerated row listed by its prompt
+            row["id"] = row["name"] + "#s0" if k == 2 else row["id"]   # an older index: sample-suffixed id only
+        (self.root / "index" / "index-ids.json").write_text(json.dumps(source))
         private = self.root / "private-heldout.jsonl"   # ids as an operator's held-out list spells them
-        private.write_text("".join(json.dumps({"id": n.replace("_", "/")}) + "\n" for n in train[:5]))
+        private.write_text("".join(json.dumps({"id": i}) + "\n" for i in
+                                   [train[0].replace("_", "/"), "prompt-1", train[2], train[3], train[4]]))
         out = self.root / "byo-index"
-        args = join.byo_capture_index(self.root / "index" / "index.json", out, [private])
+        args = join.byo_capture_index(self.root / "index" / "index-ids.json", out, [private])
         site = cd.CaptureIndex(out / "index.json", self.root / "data")
         names = {r["name"] for r in site.rows}
         self.assertEqual(names, set(train[5:]))   # no excluded row, none of the source's held-out rows
@@ -813,6 +818,47 @@ class CaptureTrainingTests(unittest.TestCase, CaptureFixture):
         records = [json.loads(line) for line in (output / "train.jsonl").read_text().splitlines()]
         self.assertEqual(records[-1]["phase"], "eval")
         self.assertEqual(records[-1]["rows"], len(site.split("heldout")))
+
+
+class RecipePipelineIndexTests(unittest.TestCase):
+    def test_recipe_pipeline_indexes_its_captured_rows(self):
+        """drafter-join's recipe pipeline indexes what scripts/capture.py wrote (``<shard>/rows/<tag>/``); it passed
+        ``--fast rows/*``, which made every row directory a root and indexed nothing."""
+
+        import argparse
+        from unittest import mock
+
+        from enntity_drafter import join
+
+        cfg = sm.load_config(TINY)
+        rows = sd.synthetic_rows(cfg, train_rows=6, heldout_rows=0, length=48)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "shard"
+
+            def fake_run(cmd: list[str], log: Path, env=None) -> None:
+                if "scripts/generate_prompts.py" in cmd:
+                    (out / "prompts").mkdir(parents=True)
+                    (out / "prompts" / "train.jsonl").write_text("".join(
+                        json.dumps({"id": r["id"], "source": "synthetic"}) + "\n" for r in rows))
+                elif "scripts/capture.py" in cmd:   # rows land in <dest>/<tag>/, records in <out>/capture-records
+                    (out / "capture-logs").mkdir(parents=True)
+                    with (out / "capture-logs" / "capture-records.jsonl").open("w") as records:
+                        for r in rows:
+                            slots = torch.cat([r["hidden_states"].permute(1, 0, 2), r["final_hidden"][None]], 0)
+                            write_fast(out / "rows" / r["id"], slots, r["token_ids"].tolist(), 0, chunk=16)
+                            records.write(json.dumps({"name": r["id"], "P": 8, "ids": r["token_ids"].tolist(),
+                                                      "source": "synthetic"}) + "\n")
+                elif "enntity_drafter.capture_io" in cmd:
+                    cd.main(cmd[cmd.index("index"):])
+
+            opts = argparse.Namespace(gen_minutes=1, spend_cap=0.0, teacher_url=None, tokenizer_dir=Path(tmp),
+                                      before_capture=None, after_capture=None, atlas_server="http://127.0.0.1:1",
+                                      capture_dir=["/capture"], capture_minutes=1)
+            with mock.patch.object(join, "_run", fake_run):
+                args = join.pipeline_store({"builder": "templates", "rows": [0, len(rows)]}, out, opts,
+                                           lambda phase: None)
+            index = json.loads(Path(args[1]).read_text())
+        self.assertEqual(len(index["rows"]), len(rows))
 
 
 class Fp8StorageTests(unittest.TestCase, CaptureFixture):

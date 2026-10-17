@@ -101,7 +101,20 @@ held-out set.
 
 ## Validator
 
-Runs on trusted GPU hardware, next to the private held-out set:
+Runs on trusted GPU hardware, next to the private held-out set. The validator host should be:
+
+- **always on**: deltas wait for it, a canary blocks a new site until its verdict, and merges happen only while it
+  runs (a laptop that sleeps stalls the network);
+- **a GPU node that does not serve the target** (one GB10 is enough; `--eval-args "... --device mps"` works on an
+  Apple GPU for trials, much slower);
+- **next to the held-out set on local disk**: every verdict evaluates it, so it must not cross a slow link, and it
+  never leaves the operator's machines;
+- **the only place the signing key exists**: `init` creates it there (0600); keep the validator token beside it.
+
+`--teacher` needs only the target's embedding, final norm and lm_head (a directory with those tensors and the
+target `config.json`), not the full model. Order of the first steps: `validator init` (publishes version 0 and
+prints the key and requirements) → `set publish_key` and `set requirements` → `set training` → invites. A site
+that registers before `publish_key` is set adopts the first key it is offered.
 
 ```
 python -m validator init --coordinator https://<host>/drafter --token-file ~/.drafter-validator-token \
