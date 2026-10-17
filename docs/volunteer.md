@@ -154,6 +154,11 @@ weights (a test enforces that it imports no tensor library).
   never deleted before an operator reviewed them, and the site sees the state (`drafter-join status`). Two
   near-identical deltas from different leases of the same shard (a re-lease after a lease expired) both count,
   the second at reduced weight.
+- **A memory dip does not cost the round.** The trainer checks host memory before every micro-step; below its
+  floor it saves a checkpoint and exits, and the client resumes the round once memory has been steady for a
+  minute (it gives up, keeping the checkpoint, only after 6 hours without memory). Checkpoints are written without
+  host copies of the state and without piling up dirty page cache. A dedicated host is still strongly
+  recommended: on a shared GB10 other users' jobs move tens of GB, and every dip pauses training.
 - **No timing rejections.** Deltas against older globals are accepted, down-weighted by 0.5 per version behind,
   as long as the base is retained. The coordinator keeps the newest 8 globals, every base of an unmerged or
   quarantined delta, and every version a site reported training from in the last 12 hours. Shard leases are
@@ -178,7 +183,7 @@ group over versions (rounded, at least an hour old), the operator-published Atla
 groups ("wanted"),
 aggregate reasons for held or quarantined deltas, and network totals. A "how it works" page explains validation.
 A site's status ages out: `stale` after two missed heartbeats, `offline` after 15 minutes, `stopped` after a clean
-stop. Heartbeats carry only phase, round, version, token counters, throughput, GPU power, MFU, GPU count and, after
+stop; `paused` while it waits for memory. Heartbeats carry only phase, round, version, token counters, throughput, GPU power, MFU, GPU count and, after
 a failed pre-upload self-check, its reason code, count, canary flag and worst check-set drop (shown to the operator
 only); any other field is refused. The audit log (registrations, invite use, verdicts, revocations) is admin-only.
 

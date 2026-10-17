@@ -31,7 +31,7 @@ DISPLAY = re.compile(r"^[\w][\w .'-]{0,31}$", re.UNICODE)
 TAG = re.compile(r"^[\w.:+-]{1,64}$", re.UNICODE)
 VERSION_TEXT = re.compile(r"^[\w.+-]{1,40}$")
 PHASES = ("idle", "setup", "canary", "claiming", "generating", "capturing", "pulling", "training", "checking",
-          "uploading", "waiting", "cleaning", "error", "stopped")
+          "uploading", "waiting", "cleaning", "error", "stopped", "paused")
 HEARTBEAT_FIELDS = {   # name: (type, min, max); anything else is refused (no free text, no hostnames)
     "phase": (str, None, None), "round": (int, 0, 10**9), "version": (int, 0, 10**9), "tokens": (float, 0, 1e15),
     "tokens_per_s": (float, 0, 1e9), "gpu_w": (float, 0, 1e5), "mfu": (float, 0, 1), "gpus": (int, 0, 64),

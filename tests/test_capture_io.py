@@ -687,7 +687,8 @@ class CaptureTrainingTests(unittest.TestCase, CaptureFixture):
         done = subprocess.run(command, cwd=REPO, env=env, capture_output=True, text=True, timeout=600)
         self.assertNotEqual(done.returncode, 0)
         last = json.loads((output / "train.jsonl").read_text().splitlines()[-1])
-        self.assertEqual((last["phase"], last["reason"], last["step"]), ("abort", "low_memory", 1))
+        # checked before every micro-step, so it stops before the first step instead of after it
+        self.assertEqual((last["phase"], last["reason"], last["step"]), ("abort", "low_memory", 0))
 
     def test_balanced_init_from_run_reports_sources_and_depths(self):
         parent = self.root / "parent"

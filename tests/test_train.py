@@ -375,6 +375,57 @@ class TrainingTests(unittest.TestCase, Fixture):
         self.run_cmd(adaptive_cmd)   # memory is back: the resumed run replays the reference stream exactly
         self.assertTrue(all(torch.equal(v, params(reference, 4)[k]) for k, v in params(adaptive, 4).items()))
 
+    def test_low_memory_pauses_with_a_checkpoint_and_resumes_exactly(self):   # dogfood: other jobs' memory spikes
+        """--low-memory pause: memory checked before every micro-step; a shortfall mid-step drops the unfinished
+        step, checkpoints the last completed one and exits 75; rerunning resumes and matches an undisturbed run."""
+
+        def params(output: Path) -> dict[str, torch.Tensor]:
+            return guarded_torch_load(output / "checkpoints" / "step-0000004" / "rank0.pt", "drafter")["params"]
+
+        common = ("--steps", "4", "--eval-every", "0", "--checkpoint-every", "100", "--grad-accum", "2",
+                  "--min-free-gb", "8", "--low-memory", "pause")
+        reference, paused = self.root / "pause-ref", self.root / "pause-run"
+        self.run_cmd(self.train_cmd(reference, *common, ranks=1))
+        # 3 readings per step (2 micro-steps + the end of the step): the 8th, before step 2's second micro-step, is low
+        env = {**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "DRAFTER_FAKE_MEMAVAIL_GB": "100x7,5"}
+        done = subprocess.run(self.train_cmd(paused, *common, ranks=1), cwd=REPO, env=env, capture_output=True,
+                              text=True, timeout=1800)
+        self.assertEqual(done.returncode, 75, done.stderr[-2000:])
+        last = json.loads((paused / "train.jsonl").read_text().splitlines()[-1])
+        self.assertEqual((last["phase"], last["reason"], last["step"]), ("pause", "low_memory", 2))
+        self.assertEqual((paused / "checkpoints" / "latest-rank0").read_text(), "step-0000002")
+        self.run_cmd(self.train_cmd(paused, *common, ranks=1))   # memory is back
+        self.assertTrue(all(torch.equal(v, params(reference)[k]) for k, v in params(paused).items()))
+
+    def test_checkpoint_leaves_no_host_copies_behind(self):   # dogfood: host memory 11 -> 32 GB after a checkpoint
+        script = """
+import json, resource, sys, tempfile
+from pathlib import Path
+import psutil, torch
+from enntity_drafter.train import save_checkpoint
+params = [torch.nn.Parameter(torch.randn(8 * 2**20)) for _ in range(4)]   # 128 MB
+optimizer = torch.optim.AdamW(params)
+sum(p.sum() for p in params).backward()
+optimizer.step()                                                            # + 256 MB of state
+model = torch.nn.Module()
+for i, p in enumerate(params):
+    model.register_parameter(f"p{i}", p)
+scale = 1 if sys.platform == "darwin" else 1024
+before, peak_before = psutil.Process().memory_info().rss, resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * scale
+with tempfile.TemporaryDirectory() as tmp:
+    save_checkpoint(Path(tmp), 1, model, optimizer, 0, 1, {"stamp": "test"})
+    after, peak = psutil.Process().memory_info().rss, resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * scale
+print(json.dumps({"rss_growth": after - before, "peak_growth": peak - peak_before}))
+"""
+        done = subprocess.run([sys.executable, "-c", script], cwd=REPO, capture_output=True, text=True, timeout=600,
+                              env={**os.environ, "PYTHONPATH": str(REPO), "OMP_NUM_THREADS": "1"})
+        self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+        growth = json.loads(done.stdout.strip().splitlines()[-1])
+        print(f"\ncheckpoint of 384 MB of state: RSS {growth['rss_growth'] / 2**20:+.0f} MB after, peak "
+              f"{growth['peak_growth'] / 2**20:+.0f} MB")
+        self.assertLess(growth["rss_growth"], 64 * 2**20)    # back to baseline after the save
+        self.assertLess(growth["peak_growth"], 128 * 2**20)  # no full host copy while saving (it was +384 MB)
+
     def test_sdpa_attention_matches_eager(self):
         """--attn sdpa (bool mask, fused kernel) computes the same model as eager (float mask)."""
 

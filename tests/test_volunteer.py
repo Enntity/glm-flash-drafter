@@ -234,7 +234,8 @@ class EndToEndTests(unittest.TestCase):
 
 class ClientTests(unittest.TestCase):
     def test_setup_smoke_and_invite_parsing(self):
-        opts = join.build_parser().parse_args(["setup", "--work", tempfile.gettempdir(), "--no-canary"])
+        opts = join.build_parser().parse_args(["setup", "--work", tempfile.gettempdir(), "--no-canary",
+                                               "--memory-sample-s", "0"])
         ok, detail = join.smoke(opts)
         self.assertTrue(ok, detail)
         self.assertIn("python >= 3.10", [check for check, _, _ in join.preflight(opts)])
@@ -554,6 +555,104 @@ class ClientTests(unittest.TestCase):
                 site._trainer({"client_id": "c4", "canary": False, "data": [], "base": {"path": "b"}},
                               {"training": training})
         self.assertEqual(events, ["terminate", "wait"])
+
+    def test_low_memory_pause_waits_for_steady_memory_then_resumes(self):   # dogfood: shared-host memory swings
+        import contextlib
+        import io
+        from unittest import mock
+
+        from enntity_drafter.train import PAUSE_EXIT
+
+        clock, beats, runs = [0.0], [], []
+        with tempfile.TemporaryDirectory() as tmp:
+            delta = Path(tmp).resolve() / "outbox" / "c5.safetensors"
+
+            class Trainer:   # pauses once (low memory), then finishes the round
+                def __init__(self, argv, **kwargs):
+                    runs.append(argv)
+                    self.returncode = PAUSE_EXIT if len(runs) == 1 else 0
+                    if self.returncode == 0:
+                        delta.parent.mkdir(exist_ok=True)
+                        delta.write_bytes(b"delta")
+
+                def poll(self):
+                    return self.returncode
+
+            class Fake:
+                def call(self, method, path, body=None, auth=True):
+                    beats.append(body["phase"])
+                    return {}
+
+            site = self.site(tmp, Fake())
+            site.phases = ["training", "paused"]
+            site.opts.trainer_arg = ["--min-free-gb=12"]
+            site.sleep = lambda s: clock.__setitem__(0, clock[0] + s)
+            training = {"lr": 1e-4, "warmup": 50, "min_lr_ratio": 0.3, "anchors": 64, "grad_accum": 1,
+                        "inner_steps": 10}
+            # MemAvailable: low for 3 readings, a short recovery, low again, then steady (12 + 4 GB headroom needed)
+            readings = "5x4,30x2,5x1,40"
+            out = io.StringIO()
+            with mock.patch.object(join.subprocess, "Popen", Trainer), \
+                    mock.patch("torch.cuda.is_available", return_value=True), \
+                    mock.patch.object(join.time, "monotonic", lambda: clock[0]), \
+                    mock.patch.dict(os.environ, {"DRAFTER_FAKE_MEMAVAIL_GB": readings}), \
+                    mock.patch("enntity_drafter.train._FAKE_READS", [0]), contextlib.redirect_stdout(out):
+                self.assertEqual(site._trainer({"client_id": "c5", "canary": False, "data": [], "base": {"path": "b"}},
+                                               {"training": training}), delta)
+            self.assertEqual(len(runs), 2)   # the same command again: the trainer resumes from its checkpoint
+            self.assertEqual(runs[0], runs[1])
+            self.assertIn("--low-memory", runs[0])
+            self.assertEqual(beats, ["paused"])
+            self.assertIn("paused: low memory", out.getvalue())
+            self.assertGreaterEqual(clock[0], join.RESUME_STEADY_S)   # waited for steady memory, not a blip
+
+    def test_moved_site_resumes_with_the_same_paths_and_refuses_otherwise(self):   # dogfood: moving a site
+        from unittest import mock
+
+        class Fake:
+            def call(self, method, path, body=None, auth=True):
+                return {"version": 0, "canary_required": False, "open_deltas": 0, "terms_sha256": terms.TERMS_SHA256,
+                        "training": {}, "trainer": None}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old = Path(tmp) / "old-host" / "work"
+            (old / "globals").mkdir(parents=True)
+            (old / "globals" / "v000000.safetensors").write_bytes(b"base")
+            (old / "byo-index").mkdir()
+            (old / "byo-index" / "index.json").write_text("{}")
+            data = Path(tmp) / "captures"
+            data.mkdir()
+            cycle = {"client_id": "c6", "canary": False, "stage": "train",
+                     "data": ["--capture-index", str(old / "byo-index" / "index.json"), "--capture-root", str(data)],
+                     "base": {"version": 0, "sha256": "0" * 64, "path": str(old / "globals" / "v000000.safetensors")}}
+            (old / "state.json").write_text(json.dumps({"rounds": 3, "tokens": 1.0, "outbox": [], "cycle": cycle}))
+            site = self.site(str(old), Fake())   # the new host, same paths: the round resumes where it stopped
+            with mock.patch.object(join.Site, "_trainer", side_effect=RuntimeError("resumed")) as trainer:
+                with self.assertRaisesRegex(RuntimeError, "resumed"):
+                    site.cycle()
+            self.assertEqual(trainer.call_args[0][0]["client_id"], "c6")
+            moved = Path(tmp) / "new-host" / "work"   # the same files under another path
+            moved.parent.mkdir()
+            old.rename(moved)
+            site = self.site(str(moved), Fake())
+            with self.assertRaises(join.JoinError) as error:
+                site.cycle()
+            self.assertIn("not on this host", str(error.exception))
+            self.assertIn("--restart-cycle", str(error.exception))
+            self.assertIsNone(error.exception.wait)   # someone has to act
+            self.assertEqual(site.state["cycle"]["client_id"], "c6")   # nothing was dropped
+
+    def test_preflight_reports_memory_swings_and_other_workloads(self):   # dogfood: a shared GB10
+        readings = iter([100.0, 99.0, 71.0, 98.0])
+        ok, detail = join.memory_steadiness(6, read=lambda: next(readings), sleep=lambda s: None)
+        self.assertIsNone(ok)
+        self.assertIn("71-100 GB", detail)
+        self.assertIn("dedicated host", detail)
+        readings = iter([100.0, 99.0, 98.0, 99.5])
+        self.assertIs(join.memory_steadiness(6, read=lambda: next(readings), sleep=lambda s: None)[0], True)
+        self.assertIsNone(join.memory_steadiness(6, read=lambda: float("inf"))[0])   # not measurable here
+        gpu, big = join.other_processes()
+        self.assertTrue(isinstance(gpu, int) and isinstance(big, int))   # counts only
 
     def test_redeem_without_a_terminal_exits_cleanly(self):   # dogfood: EOFError after printing the terms
         import contextlib

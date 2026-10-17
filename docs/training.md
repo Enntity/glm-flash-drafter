@@ -115,8 +115,16 @@ over the run's ranks) the probe also sizes the micro-batch: it tries the
 largest `--anchors` first and smaller splits of N after it, then sets
 `--grad-accum` so micro x accum x ranks = N, logged as a `batch` record; a
 resumed run tries its checkpoint's micro-batch first, so the stream replays
-exactly while memory allows. `--min-free-gb`
-stops every rank cleanly when host MemAvailable falls below it;
+exactly while memory allows. The probe's margin also counts what it cannot
+see: the optimizer state, the loader's queued samples and a checkpoint's
+transient. `--min-free-gb` is checked before every micro-step (memory used by
+other jobs moves within a step): `--low-memory abort` (default) stops every
+rank cleanly; `--low-memory pause` drops the unfinished step, checkpoints the
+last completed one and exits with code 75, and the same command resumes it
+exactly (drafter-join waits for memory and does so). Checkpoints are written
+straight from the training tensors (torch.save copies one storage at a time),
+written back to disk every 256 MB so dirty page cache stays small, and freed
+host memory is returned to the OS afterwards;
 `--max-mem-fraction` caps the CUDA allocator; an OOM exits the rank at once.
 `--time-budget-h` plans the step count from smoke-step timings
 (`--smoke-steps`).

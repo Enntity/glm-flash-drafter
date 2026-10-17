@@ -450,7 +450,8 @@ class Diloco:
 
     def state_dict(self) -> dict[str, Any]:
         def cpu(views: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-            return {name: views[name].detach().cpu().clone() for name, _ in self.named}
+            # no host copies: the trainer's torch.save copies one storage at a time (save_checkpoint)
+            return {name: views[name].detach() for name, _ in self.named}
 
         return {"round": self.round, "global": cpu(self.views), "base": dict(self.base),
                 "momentum": cpu(self.momentum_views) if self.momentum else {},

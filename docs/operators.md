@@ -121,7 +121,8 @@ missing, and `attention` lists the missing settings under `missing_settings`. A 
 arrived: for example "site X: canary self-check failed: heldout_regression x2", with the worst public check-set
 drop; reported in heartbeats, no data) and `silent_sites` (sites seen in the last day whose heartbeats stopped
 without a clean stop: `stale` after two missed heartbeats, `offline` after `DRAFTER_ONLINE_S`, 15 minutes). The
-dashboard shows the same statuses, so a stopped process never looks like it is training.
+dashboard shows the same statuses (and `paused` while a site waits for memory), so a stopped process never looks
+like it is training.
 
 `training` is the only trainer configuration a site takes from the network, and the client accepts only typed
 numeric keys from it (`lr`, `warmup`, `min_lr_ratio`, `anchors`, `global_anchors`, `weight_decay`, `beta1`,

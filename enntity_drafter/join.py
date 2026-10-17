@@ -54,7 +54,11 @@ HOME = Path(os.environ.get("DRAFTER_HOME", Path.home() / ".enntity-drafter"))
 #: and derives grad_accum; without it ``anchors`` and ``grad_accum`` are used as given.
 TRAINING_KEYS = {"lr": float, "warmup": int, "min_lr_ratio": float, "anchors": int, "weight_decay": float,
                  "beta1": float, "beta2": float, "clip": float, "grad_accum": int, "crop": int, "global_anchors": int}
-MEMORY_GUARDS = ("--min-free-gb", "12", "--probe-headroom-gb", "4")   # CUDA sites, unless given locally
+#: CUDA sites, unless given locally: stop below 12 GiB free, but by pausing (checkpoint, exit, resume here once
+#: memory is back) rather than dying; the probe keeps 4 GiB more for memory other jobs on the host take and give back.
+MEMORY_GUARDS = ("--min-free-gb", "12", "--probe-headroom-gb", "4", "--low-memory", "pause")
+RESUME_STEADY_S = 60    # a paused round resumes once memory stayed above its floor + headroom this long
+PAUSE_MAX_H = 6.0       # ... and gives up (round kept, checkpointed) after this long without memory
 FINAL = ("accepted", "merged", "quarantined")
 CHECK_FRACTION = 0.05   # rows of a shard kept out of training as the public self-check set
 CHECK_ROWS_MAX = 64     # ... at most this many rows of a large bring-your-own index
@@ -469,21 +473,27 @@ class Site:
         argv += [a for flag, value in network.items() for a in (flag, value)]
         self._warn_overrides(network)
         argv += self.local_trainer_args()
+        from .train import PAUSE_EXIT
+
         log = self.work / "logs" / f"train-{cycle['client_id']}.log"
         log.parent.mkdir(parents=True, exist_ok=True)
-        with log.open("a") as stream:
-            proc = subprocess.Popen(argv, cwd=REPO, stdout=stream, stderr=subprocess.STDOUT)
-            try:
-                while proc.poll() is None:
-                    self._progress(out / "train.jsonl", inner)
-                    time.sleep(2)
-            except BaseException:   # stopped (Ctrl-C, SIGTERM): the trainer stops too; its checkpoint resumes
-                proc.terminate()
+        while True:
+            with log.open("a") as stream:
+                proc = subprocess.Popen(argv, cwd=REPO, stdout=stream, stderr=subprocess.STDOUT)
                 try:
-                    proc.wait(60)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                raise
+                    while proc.poll() is None:
+                        self._progress(out / "train.jsonl", inner)
+                        time.sleep(2)
+                except BaseException:   # stopped (Ctrl-C, SIGTERM): the trainer stops too; its checkpoint resumes
+                    proc.terminate()
+                    try:
+                        proc.wait(60)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    raise
+            if proc.returncode != PAUSE_EXIT:
+                break
+            self._wait_for_memory(argv, canary)   # the trainer checkpointed and exited: resume once memory is back
         self._progress(out / "train.jsonl", inner)
         if proc.returncode or not delta.is_file():
             again = "drafter-join setup` with the same flags" if canary else "drafter-join run`"
@@ -523,6 +533,41 @@ class Site:
             if "--probe" not in local:
                 local.append("--probe")
         return local
+
+    def _wait_for_memory(self, argv: list[str], canary: bool) -> None:
+        """The trainer paused on low memory (another job on the host took it).  Wait until MemAvailable stays above
+        the trainer's floor plus its probe headroom for ``RESUME_STEADY_S``, then return to resume the round; give
+        up after ``PAUSE_MAX_H`` (the round stays checkpointed for the next run)."""
+
+        from .train import mem_available_gb
+
+        def value(flag: str, default: float) -> float:
+            for i, arg in enumerate(argv):   # the last occurrence wins, as in argparse
+                if arg.startswith(flag + "="):
+                    default = float(arg.split("=", 1)[1])
+                elif arg == flag and i + 1 < len(argv):
+                    default = float(argv[i + 1])
+            return default
+
+        need = value("--min-free-gb", 0.0) + value("--probe-headroom-gb", 0.0)
+        self.phase = "paused" if "paused" in self.phases else "waiting"   # older coordinators: no "paused"
+        self.heartbeat()
+        say(f"paused: low memory ({mem_available_gb():.0f} GB available); the {'canary' if canary else 'round'} is "
+            f"checkpointed and resumes by itself once {need:.0f} GB stay available for {RESUME_STEADY_S} s")
+        started = steady = time.monotonic()
+        while True:
+            now = time.monotonic()
+            if mem_available_gb() < need:
+                steady = now
+            elif now - steady >= RESUME_STEADY_S:
+                break
+            if now - started > PAUSE_MAX_H * 3600:
+                raise JoinError(f"memory stayed below {need:.0f} GB for {PAUSE_MAX_H:.0f} h; the "
+                                f"{'canary' if canary else 'round'} is kept (checkpointed). Free memory on this host "
+                                "(or move the site, JOIN.md), then rerun `drafter-join run` to resume it.")
+            self.sleep(10)
+        self.phase = "canary" if canary else "training"
+        say("memory is back: resuming from the checkpoint (the probe runs again first)")
 
     def _warn_overrides(self, network: dict[str, str]) -> None:
         """--trainer-arg wins over the network's settings (an escape hatch, for example a smaller --anchors on a
@@ -605,7 +650,13 @@ class Site:
 
         req = self.requirements()
         self._drain_outbox()
+        if getattr(self.opts, "restart_cycle", False) and self.state.get("cycle"):
+            say("--restart-cycle: the interrupted cycle starts over (finished deltas are kept)")
+            self.state["cycle"], self.opts.restart_cycle = None, False
+            self.save()
         cycle = self.state.get("cycle")
+        if cycle is not None:
+            self.check_paths(cycle)
         if cycle is None and not req["canary_required"] and self.state.get("parked"):
             cycle = self.state["cycle"] = self.state["parked"].pop(0)   # a delta that waited for the canary
             self.save()
@@ -798,6 +849,26 @@ class Site:
         return JoinError(f"{why}. The delta is kept at {kept}. {self.next_step(cycle)}")
 
     @staticmethod
+    def check_paths(cycle: dict[str, Any]) -> None:
+        """An interrupted cycle resumes only where its files are (a site moved to another host resumes when the
+        work and data paths are the same there); otherwise stop with what to do."""
+
+        stage = cycle.get("stage")
+        data = cycle.get("data") or []
+        paths = [data[i + 1] for i, flag in enumerate(data[:-1])
+                 if flag in ("--features", "--capture-index", "--capture-root")]
+        if stage in ("train", "upload", "verdict") and cycle.get("base"):
+            paths.append(cycle["base"]["path"])
+        if stage in ("upload", "verdict") and cycle.get("delta"):
+            paths.append(cycle["delta"])
+        missing = [p for p in paths if not Path(p).exists()]
+        if missing:
+            raise JoinError(f"the interrupted {'canary' if cycle.get('canary') else 'round'} uses files that are not "
+                            f"on this host: {', '.join(missing[:3])}. Make them available at the same paths (same "
+                            "--work and data directories, or symlinks), or start the cycle over with "
+                            "`drafter-join run --restart-cycle` (its progress is lost; finished deltas are kept).")
+
+    @staticmethod
     def next_step(cycle: dict[str, Any]) -> str:
         """The exact command after a cycle was given up (JOIN.md: `setup` ends with the canary)."""
 
@@ -931,6 +1002,55 @@ def open_file_check() -> tuple[bool | None, str]:
     return None, detail
 
 
+SWING_WARN_GB = 8.0     # MemAvailable moving more than this while sampled: other jobs come and go on this host
+BIG_PROCESS_GB = 4.0    # another process this large (or any other GPU process) is reported, by count only
+
+
+def memory_steadiness(seconds: float, read: Callable[[], float] | None = None,
+                      sleep: Callable[[float], None] = time.sleep) -> tuple[bool | None, str]:
+    """Sample MemAvailable for ``seconds``: a GB10 shared with other users' containers swings by tens of GB, which
+    the trainer then has to pause through (or a host-level guard kills it)."""
+
+    from .train import mem_available_gb
+
+    read = read or mem_available_gb
+    samples = [read()]
+    if math.isinf(samples[0]):
+        return None, "not measured (no MemAvailable on this OS)"
+    for _ in range(int(seconds // 2)):
+        sleep(2)
+        samples.append(read())
+    low, high = min(samples), max(samples)
+    detail = f"MemAvailable {low:.0f}-{high:.0f} GB over {seconds:.0f} s"
+    if high - low > SWING_WARN_GB:
+        return None, (f"{detail}: other jobs on this host move memory; a dedicated host is strongly recommended "
+                      "(the trainer pauses and resumes through dips, which costs time)")
+    return True, detail
+
+
+def other_processes(me: int | None = None) -> tuple[int, int]:
+    """(other GPU compute processes, other processes above ``BIG_PROCESS_GB`` resident): counts only."""
+
+    me = os.getpid() if me is None else me
+    gpu = 0
+    try:
+        done = subprocess.run(["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
+                              capture_output=True, text=True, timeout=30)
+        gpu = sum(1 for line in done.stdout.split() if line.strip().isdigit() and int(line) != me)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    big = 0
+    for status in Path("/proc").glob("[0-9]*/status"):
+        try:
+            if int(status.parent.name) == me:
+                continue
+            rss = next((int(l.split()[1]) for l in status.read_text().splitlines() if l.startswith("VmRSS:")), 0)
+        except (OSError, ValueError):
+            continue
+        big += rss / 2**20 >= BIG_PROCESS_GB
+    return gpu, big
+
+
 def preflight(opts: argparse.Namespace) -> list[tuple[str, str, str]]:
     """(check, PASS|WARN|FAIL, detail or fix) for this host."""
 
@@ -956,6 +1076,12 @@ def preflight(opts: argparse.Namespace) -> list[tuple[str, str, str]]:
     except ImportError:
         add("torch 2.11-2.12", False, "pip install 'torch>=2.11,<2.13'")
     add("open-file limit", *open_file_check())
+    add("memory steadiness", *memory_steadiness(getattr(opts, "memory_sample_s", 60)))
+    gpu, big = other_processes()
+    add("other workloads", True if not gpu and not big else None,
+        f"{gpu} other GPU process(es), {big} other process(es) above {BIG_PROCESS_GB:.0f} GB"
+        + ("" if not gpu and not big else ": this host is shared; expect their memory peaks during training (a "
+                                          "dedicated host is strongly recommended)"))
     try:
         import speculators  # noqa: F401
 
@@ -1074,6 +1200,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="extra local trainer flag (performance, memory guards), repeatable")
         q.add_argument("--rounds", type=int, default=None, help="stop after N rounds (default: run forever)")
         q.add_argument("--canary-timeout-s", type=float, default=3600)
+        q.add_argument("--restart-cycle", action="store_true",
+                       help="drop an interrupted cycle and start it over (finished deltas are kept)")
         q.add_argument("--no-public-check", action="store_true")
         q.add_argument("--eval-inprocess", action="store_true", help=argparse.SUPPRESS)
         q.add_argument("--teacher-url", default=None, help="recipe: your own OpenAI-compatible GLM-5.3-Flash server")
@@ -1092,6 +1220,8 @@ def build_parser() -> argparse.ArgumentParser:
             q.add_argument("--model-dir", default=None)
             q.add_argument("--atlas-image", default=None)
             q.add_argument("--no-canary", action="store_true")
+            q.add_argument("--memory-sample-s", type=float, default=60,
+                           help="how long setup samples MemAvailable for swings caused by other jobs")
     q = sub.add_parser("update", help="pull this checkout (fast-forward only) and reinstall")
     q.add_argument("--yes", action="store_true")
     return p

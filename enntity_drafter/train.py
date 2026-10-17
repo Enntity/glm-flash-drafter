@@ -309,12 +309,22 @@ def autocast(device: torch.device):
 # Smoke / memory safety (GB10 unified memory: exhaustion hangs the host)
 # --------------------------------------------------------------------------
 
+_FAKE_READS = [0]
+
+
 def mem_available_gb() -> float:
-    """Host MemAvailable (GB10: CPU and GPU share it).  Tests may fake it."""
+    """Host MemAvailable (GB10: CPU and GPU share it).  Tests may fake it: ``DRAFTER_FAKE_MEMAVAIL_GB`` is a
+    constant, or a schedule of readings such as ``100x7,5`` (seven readings of 100, then 5 from then on)."""
 
     fake = os.environ.get("DRAFTER_FAKE_MEMAVAIL_GB")
     if fake:
-        return float(fake)
+        schedule = [(float(v), int(n or 0)) for v, _, n in (part.partition("x") for part in fake.split(","))]
+        index, _FAKE_READS[0] = _FAKE_READS[0], _FAKE_READS[0] + 1
+        for value, count in schedule:
+            if not count or index < count:
+                return value
+            index -= count
+        return schedule[-1][0]
     try:
         with open("/proc/meminfo") as stream:
             for line in stream:
@@ -336,6 +346,9 @@ def memory_consensus(device: torch.device, world: int) -> tuple[float, float]:
     if world > 1:
         dist.all_reduce(values, op=dist.ReduceOp.MAX)
     return -float(values[0]), float(values[1])
+
+
+PAUSE_EXIT = 75   # EX_TEMPFAIL: --low-memory pause saved a checkpoint; rerun the same command once memory is back
 
 
 def abort_run(emit, record: dict[str, Any], world: int, code: int = 3) -> None:
@@ -422,15 +435,28 @@ def choose_batch(candidates: list[tuple[int, int]], probe: Callable[[int], tuple
     return None, records
 
 
+def loader_memory_gb(args: argparse.Namespace, cfg: dict[str, Any], streaming: bool) -> float:
+    """Host memory the training loader holds once running: capture samples queued by the prefetch threads (two
+    per thread, one in use; page-locked copies too with --pin-loader), each up to crop + window + block rows of
+    every captured layer plus the final hidden state; or the row store's feature cache."""
+
+    if not streaming:
+        return args.feature_cache_bytes / 1e9
+    rows = (args.crop or 4096) + cfg["sliding_window"] + cfg["block_size"]
+    sample = rows * (len(cfg["target_layer_ids"]) + 1) * cfg["target_hidden_size"] * (1 if args.fp8_device else 2)
+    return sample * (2 * max(1, args.loader_workers) + 1) * (2 if args.pin_loader else 1) / 1e9
+
+
 def select_batch(args: argparse.Namespace, resumed: dict[str, Any], model: nn.Module, cfg: dict[str, Any],
                  device: torch.device, dtype: torch.dtype, kwargs: dict[str, Any], selector_prefix: dict[str, Any],
-                 optimizer: torch.optim.Optimizer, world: int, emit, step: int) -> None:
+                 optimizer: torch.optim.Optimizer, world: int, emit, step: int, streaming: bool) -> None:
     """Set ``args.anchors`` and ``args.grad_accum``: :func:`batch_candidates`, each checked by a worst-case probe
     (``--probe``, run at every start and resume: memory shared with other services changes) that must leave
     ``--min-free-gb`` + ``--probe-headroom-gb`` free.  A resumed run first tries its checkpoint's micro-batch (the
     stream then replays exactly), smaller ones only if that no longer fits."""
 
     candidates = batch_candidates(args.anchors, args.grad_accum, args.global_anchors, world)
+    loader_gb = loader_memory_gb(args, cfg, streaming)
     if resumed.get("anchors") and args.global_anchors:
         candidates = [c for c in candidates if c[0] <= int(resumed["anchors"])] or candidates[-1:]
 
@@ -451,11 +477,17 @@ def select_batch(args: argparse.Namespace, resumed: dict[str, Any], model: nn.Mo
         flag = torch.tensor([float(oom)], device=device)
         if world > 1:   # every rank takes the same decision
             dist.all_reduce(flag, op=dist.ReduceOp.MAX)
-        # AdamW state (2 fp32 tensors per parameter) is allocated at the first
-        # optimizer step, after the probe: count it against the margin now.
-        pending = 0.0 if optimizer.state else 2 * sum(p.numel() * 4 for _, p in trainable(model)) / 1e9
+        # Memory the run needs later that the probe cannot see: AdamW state (2 fp32 tensors per parameter, allocated
+        # at the first optimizer step), the loader's queued samples (it starts after the probe) and a checkpoint's
+        # transient (one tensor or DiLoCo fragment plus WrittenBack's unsynced bytes).
+        optimizer_gb = 0.0 if optimizer.state else 2 * sum(p.numel() * 4 for _, p in trainable(model)) / 1e9
+        largest = max(p.numel() * 4 for _, p in trainable(model))
+        checkpoint_gb = (max(largest, args.diloco_fragment_mb * 2**20 if args.sync_mode == "diloco" else 0)
+                         + WrittenBack.chunk) / 1e9
+        pending = optimizer_gb + loader_gb + checkpoint_gb
         record.update(anchors=anchors, probe_peak_mem_gb=round(peak, 2), probe_min_mem_available_gb=round(free, 2),
-                      probe_pending_optimizer_gb=round(pending, 2))
+                      probe_pending_optimizer_gb=round(optimizer_gb, 2), probe_pending_loader_gb=round(loader_gb, 2),
+                      probe_pending_checkpoint_gb=round(checkpoint_gb, 2))
         return not flag.item() and free - pending >= args.min_free_gb + args.probe_headroom_gb, record
 
     chosen, records = choose_batch(candidates, probe if args.probe else None)
@@ -623,16 +655,49 @@ def summarize_eval(rows: int, totals: dict[str, float], top_k: int) -> dict[str,
 # Rank-local resume checkpoints
 # --------------------------------------------------------------------------
 
-def _optimizer_to_cpu(optimizer: torch.optim.Optimizer) -> dict[str, Any]:
-    # state_dict() shares the per-parameter state dicts with the live
-    # optimizer; build new dicts so the live state is untouched.
-    state = optimizer.state_dict()
-    state["state"] = {
-        index: {key: value.detach().cpu().clone() if isinstance(value, torch.Tensor) else value
-                for key, value in values.items()}
-        for index, values in state["state"].items()
-    }
-    return state
+def release_host_memory() -> None:
+    """Return freed host memory to the OS (glibc keeps freed heap pages otherwise, and RSS stays high)."""
+
+    gc.collect()
+    if sys.platform.startswith("linux"):
+        try:
+            import ctypes
+
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except (OSError, AttributeError):
+            pass
+
+
+class WrittenBack:
+    """A write-only file for ``torch.save`` that writes back and drops what it wrote every ``chunk`` bytes: a
+    checkpoint is many GB of dirty page cache otherwise, which MemAvailable does not count as free until the kernel
+    has written it (GB10: the same memory the GPU uses)."""
+
+    chunk = 256 * 2**20
+
+    def __init__(self, path: Path):
+        self.stream, self.written, self.synced = open(path, "wb"), 0, 0
+
+    def write(self, data) -> int:
+        self.stream.write(data)
+        self.written += len(data)
+        if self.written - self.synced >= self.chunk:
+            self.sync()
+        return len(data)
+
+    def flush(self) -> None:
+        self.stream.flush()
+
+    def sync(self) -> None:
+        self.stream.flush()
+        os.fsync(self.stream.fileno())
+        if hasattr(os, "posix_fadvise"):
+            os.posix_fadvise(self.stream.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+        self.synced = self.written
+
+    def close(self) -> None:
+        self.sync()
+        self.stream.close()
 
 
 def save_checkpoint(output: Path, step: int, model: nn.Module, optimizer: torch.optim.Optimizer,
@@ -656,14 +721,23 @@ def save_checkpoint(output: Path, step: int, model: nn.Module, optimizer: torch.
         # The host copy below is ~14 GB; give the activation cache back to the
         # (unified) host memory first.
         torch.cuda.empty_cache()
+    # Tensors go in as they are (no host copies): torch.save copies one storage at a time to host memory while
+    # writing, so the host transient is one tensor, not params + optimizer state (14 GB and more), and nothing
+    # is left behind afterwards.  The save is synchronous, so the live state cannot change meanwhile.
     payload = {
         "step": step, "rank": rank, "world": world, "counters": dict(counters or {}),
-        "params": {n: p.detach().cpu().clone() for n, p in (named or trainable(model))},
-        "optimizer": _optimizer_to_cpu(optimizer), **(extra or {}),
+        "params": {n: p.detach() for n, p in (named or trainable(model))},
+        "optimizer": optimizer.state_dict(), **(extra or {}),
     }
     temporary = directory / f"rank{rank}.pt.tmp"
-    torch.save(payload, temporary)
+    stream = WrittenBack(temporary)
+    try:
+        torch.save(payload, stream)
+    finally:
+        stream.close()
+    del payload
     os.replace(temporary, directory / f"rank{rank}.pt")
+    release_host_memory()
     barrier(world)
     (output / "checkpoints" / f"latest-rank{rank}").write_text(directory.name)
     if keep:
@@ -698,7 +772,10 @@ def load_checkpoint(output: Path, model: nn.Module, optimizer: torch.optim.Optim
     optimizer.load_state_dict(payload["optimizer"])
     if extras is not None:
         extras["diloco"] = payload.get("diloco")
-    return int(payload["step"]), dict(payload.get("counters", {}))
+    step, counters = int(payload["step"]), dict(payload.get("counters", {}))
+    del payload
+    release_host_memory()
+    return step, counters
 
 
 @torch.no_grad()
@@ -1005,6 +1082,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="before step 0: one worst-case-size forward/backward (synthetic), memory checked")
     p.add_argument("--min-free-gb", type=float, default=0.0,
                    help="abort cleanly (exit 3) when any rank's host MemAvailable falls below this")
+    p.add_argument("--low-memory", choices=["abort", "pause"], default="abort",
+                   help="below --min-free-gb (checked before every micro-step): abort (exit 3), or pause: save a "
+                        "checkpoint at the last completed step and exit with code 75 so the caller can resume once "
+                        "memory is back (drafter-join does)")
     p.add_argument("--probe-headroom-gb", type=float, default=0.0,
                    help="--probe: the micro-batch must leave this much above --min-free-gb (memory shared with "
                         "other services moves)")
@@ -1193,7 +1274,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     selector_prefix = {"floor": args.prefix_floor, "eal_weight": args.eal_weight}
     if not args.eval_only:   # before the stream: its items depend on the micro-batch
         select_batch(args, counters if start_step else {}, model, cfg, device, compute_dtype, kwargs,
-                     selector_prefix, optimizer, world, emit, start_step)
+                     selector_prefix, optimizer, world, emit, start_step, capture is not None)
     items_start = int(counters.get("items_done", start_step * args.grad_accum))   # micro-steps consumed per rank
     if capture is not None:
         if not args.eval_only:
@@ -1293,6 +1374,31 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     power = fp.PowerSampler(device)
     profiler, profiled_seconds, profiled_flops = None, [], {}
     clean: dict[str, Any] = {"seconds": [], "flops": 0.0, "useful": 0.0, "watts": []}   # unprofiled warmup steps
+    def checkpoint(completed: int) -> None:
+        save_checkpoint(output, completed, model, optimizer, rank, world, provenance,
+                        {"tokens_seen": tokens_seen, "eval_s": eval_s, "anchors": args.anchors,
+                         "grad_accum": args.grad_accum,
+                         "items_done": items_start + (completed - start_step) * args.grad_accum,
+                         **({"round_start_tokens": round_start_tokens} if diloco is not None else {}),
+                         **({"planned_steps": args.steps} if args.time_budget_h is not None else {}),
+                         **({"cap_switch_item": cap_switch} if cap_switch is not None else {})}, owned,
+                        keep=args.keep_checkpoints,
+                        extra={"diloco": diloco.state_dict()} if diloco is not None else None)
+
+    def low_memory(completed: int, free: float, peak: float) -> None:
+        """Below --min-free-gb: abort, or (pause) checkpoint the last completed step and exit for a resume."""
+
+        record = {"reason": "low_memory", "step": completed, "min_mem_available_gb": round(free, 2),
+                  "peak_mem_gb": round(peak, 2)}
+        if args.low_memory == "abort":
+            abort_run(emit, record, world)
+        optimizer.zero_grad(set_to_none=True)   # the unfinished step is redone after the resume
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        if completed > start_step:
+            checkpoint(completed)
+        abort_run(lambda r: emit({**r, "phase": "pause"}), record, world, PAUSE_EXIT)
+
     step = start_step
     while step < args.steps:
         if args.perf_profile and step == start_step + args.perf_warmup:
@@ -1318,6 +1424,10 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         deferred: dict[str, torch.Tensor] = {}   # --deferred-metrics: device-side sums
         step_rows: list[str] = []
         for micro in range(args.grad_accum):
+            if args.min_free_gb:   # before every micro-step: memory used by other jobs moves within a step
+                free, peak = memory_consensus(device, world)
+                if free < args.min_free_gb:
+                    low_memory(step, free, peak)
             global_index = (items_start + (step - start_step) * args.grad_accum + micro) * data_world + data_rank
             if samples is not None:
                 waited = time.monotonic()
@@ -1493,9 +1603,8 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
                     emit({"phase": "sources_planned", **sources_record(stream, args.steps * args.grad_accum, world)})
                 if rank == 0:
                     (output / "smoke.json").write_text(json.dumps(summary, indent=2))
-        if free < args.min_free_gb:
-            abort_run(emit, {"reason": "low_memory", "step": completed, "min_mem_available_gb": round(free, 2),
-                             "peak_mem_gb": round(peak, 2)}, world)
+        if free < args.min_free_gb and not (round_end and external and args.low_memory == "pause"):
+            low_memory(completed, free, peak)   # (a finished external round writes its delta first, then exits)
         window["supervised"] += supervised
         window["context"] += context
         if completed % args.log_every == 0 or completed == args.steps:
@@ -1555,15 +1664,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         if round_end:
             round_start_tokens = tokens_seen
         if completed % args.checkpoint_every == 0 or completed == args.steps or (round_end and external):
-            save_checkpoint(output, completed, model, optimizer, rank, world, provenance,
-                            {"tokens_seen": tokens_seen, "eval_s": eval_s, "anchors": args.anchors,
-                             "grad_accum": args.grad_accum,
-                             "items_done": items_start + (completed - start_step) * args.grad_accum,
-                             **({"round_start_tokens": round_start_tokens} if diloco is not None else {}),
-                             **({"planned_steps": args.steps} if args.time_budget_h is not None else {}),
-                             **({"cap_switch_item": cap_switch} if cap_switch is not None else {})}, owned,
-                            keep=args.keep_checkpoints,
-                            extra={"diloco": diloco.state_dict()} if diloco is not None else None)
+            checkpoint(completed)
         if round_end and external:
             break   # one round per run: the coordinator merges, the next run starts from its weights
         if args.stop_after is not None and completed >= args.stop_after:

@@ -9,11 +9,18 @@ Background: [docs/volunteer.md](docs/volunteer.md). Only weight deltas and count
 ## Safety rules (always)
 
 1. **GB10 memory is shared by CPU and GPU; exhausting it can hang the host.** Never start the GLM-5.3-Flash
-   server and the trainer on the same node at the same time. Keep the trainer's memory guards (the client adds
-   `--min-free-gb 12 --probe` unless you pass your own `--min-free-gb`).
-2. Activations are deleted after each round; do not copy them elsewhere.
-3. Never paste the site token (in `~/.enntity-drafter/config.json`) into chat, logs or issues.
-4. Do not train on data you are not allowed to use, or on anything derived from incoai or other non-commercial
+   server and the trainer on the same node at the same time. Keep the trainer's memory guards (on a GPU the client
+   adds `--min-free-gb 12 --probe-headroom-gb 4 --low-memory pause` unless you pass your own values, and always
+   `--probe`). Below the floor the trainer pauses: it saves a checkpoint and exits, and the client resumes the
+   round once memory has been back for a minute, so a dip costs at most the unfinished step.
+2. **Use a dedicated host if you can.** On a shared GB10, other users' containers and services come and go and
+   move tens of GB (a ~28 GB build container is enough to push a training host from 113 GB available to under
+   8 GB). Before joining, check what else runs (`free -g`, `nvidia-smi`, `docker stats --no-stream`) and expect
+   their peaks while you train; `drafter-join setup` samples memory for a minute and counts other GPU and large
+   processes. A shared host trains, but pauses through every peak.
+3. Activations are deleted after each round; do not copy them elsewhere.
+4. Never paste the site token (in `~/.enntity-drafter/config.json`) into chat, logs or issues.
+5. Do not train on data you are not allowed to use, or on anything derived from incoai or other non-commercial
    checkpoints or data. Every upload attests to this.
 
 ## 1. Install
@@ -118,7 +125,7 @@ drafter-join setup --teacher <GLM dir> --model-dir <GLM dir> [--peer <second nod
 ```
 
 Expected: one line per check, `PASS`, `WARN` or `FAIL` (including `Triton build`, which compiles a trivial GPU
-kernel, and `open-file limit`), then `PASS smoke (tiny train + delta checks)`, then a canary (20 training steps
+kernel, `open-file limit`, `memory steadiness`, a minute of MemAvailable samples, and `other workloads`), then `PASS smoke (tiny train + delta checks)`, then a canary (20 training steps
 from the current global, uploaded and validated, a few minutes) ending in `canary ... accepted: this site is
 ready`. Fix every `FAIL` with the hint on its line and rerun. `WARN` lines are advisory (for example no RDMA device
 in bring-your-own mode). A `version mismatch` or `terms changed` message: run `drafter-join update --yes`, then
@@ -175,6 +182,23 @@ WantedBy=default.target
 then `systemctl --user daemon-reload && systemctl --user enable --now drafter-join` (logs: `journalctl --user -u
 drafter-join -f`; stop: `systemctl --user stop drafter-join`).
 
+### Moving the site to another machine
+
+Stop `drafter-join run` (Ctrl-C or SIGTERM; an interrupted round is checkpointed), then copy `~/.enntity-drafter`
+to the new machine with its permissions (`config.json` holds the token and must stay mode 0600; the default work
+directory `~/.enntity-drafter/work` holds the round in progress, its checkpoints and any delta not yet received):
+
+```
+rsync -a ~/.enntity-drafter/ <new host>:.enntity-drafter/      # then on the new host: chmod 600 ~/.enntity-drafter/config.json
+```
+
+On the new machine install this repository (step 1) and run `drafter-join setup` with `--no-canary` to check the
+host, then `drafter-join run` with the same flags. The interrupted round resumes where it stopped when its files
+are at the same paths there (the same user name and home, or the same `--work` and data directories; symlinks
+work). Otherwise the client stops and names the missing files: make them available at those paths, or start the
+round over with `drafter-join run --restart-cycle` (its progress is lost; finished deltas are kept and still
+uploaded). Do not run the same site on two machines at once.
+
 ## 6. Verify
 
 ```
@@ -194,6 +218,9 @@ invite link (the part before `/join`, `https://<host>/<path>/`).
 | `self-check failed before upload` | nothing was uploaded; read the code (layout, non_finite, norm_high ...) and report it with the trainer log path it prints; the message ends with the command to run next |
 | `canary not accepted` | fix the cause named in the message, then rerun the same `drafter-join setup` command (it runs a new canary) |
 | `training failed ... see <log>` with `Python.h` or a compiler error | Triton cannot compile: see the prerequisites in step 1, then rerun setup |
+| `paused: low memory` | nothing to do: another process took memory; the round is checkpointed and resumes by itself once memory is back (`drafter-join status`; the dashboard shows `paused`). Frequent pauses: see safety rule 2 |
+| `memory stayed below ... for 6 h` | the round is kept; free memory on the host or move the site, then rerun `drafter-join run` |
+| `uses files that are not on this host` | after moving a site: see "Moving the site to another machine" |
 | `the network has not published training settings yet` | nothing to do on your side; `run` waits and retries, or rerun setup later |
 | `training failed ... see <log>` | read the log; rerun to resume (the memory probe runs again first); out-of-memory or `probe_low_memory`: stop other processes, or as a last resort cap the micro-batch with `--trainer-arg=--anchors=256` (the client warns that it overrides the network's setting; with a network `global_anchors` the probe already picks a smaller micro-batch by itself) |
 | `no recipe shard is open` | the client waits and retries; or switch to bring-your-own mode |
