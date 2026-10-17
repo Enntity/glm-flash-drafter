@@ -59,7 +59,9 @@ to end across sites.
   teacher text with GLM-5.3-Flash (your own server, or an API key of your choice), capture hidden states with the
   Atlas capture build, train. Spot checks can replay recipe shards.
 - **bring your own data (byo)**: train on your own captured data. It never leaves your machine; you may give an
-  opaque tag. No spot checks are possible in this mode; the held-out check still applies.
+  opaque tag. No spot checks are possible in this mode; the held-out check still applies. From a capture index the
+  site uses only rows marked `train`, minus any ids in `--byo-exclude-ids` files, and carves its public check set
+  (at most 64 rows) from them by hash; nothing is generated or captured.
 
 In both modes only weight deltas and metadata are uploaded: mode, recipe id or tag, token and step counts,
 trainer version, base hash, and a signed data-source attestation (no incoai or other non-commercial or derived

@@ -783,6 +783,37 @@ class CaptureTrainingTests(unittest.TestCase, CaptureFixture):
         self.assertEqual(records[-1]["phase"], "eval")
         self.assertEqual(records[-1]["step"], 20)
 
+    def test_byo_index_excludes_private_heldout_and_trains(self):
+        """drafter-join's bring-your-own index: an existing capture index (whose held-out split may be someone
+        else's private set) minus excluded ids; the check split is carved from train rows only; the trainer reads
+        it in place."""
+
+        from enntity_drafter import join
+
+        source = json.loads((self.root / "index" / "index.json").read_text())
+        train = [r["name"] for r in source["rows"] if r["split"] == "train"]
+        private = self.root / "private-heldout.jsonl"   # ids as an operator's held-out list spells them
+        private.write_text("".join(json.dumps({"id": n.replace("_", "/")}) + "\n" for n in train[:5]))
+        out = self.root / "byo-index"
+        args = join.byo_capture_index(self.root / "index" / "index.json", out, [private])
+        site = cd.CaptureIndex(out / "index.json", self.root / "data")
+        names = {r["name"] for r in site.rows}
+        self.assertEqual(names, set(train[5:]))   # no excluded row, none of the source's held-out rows
+        self.assertEqual(site.index["byo"]["dropped"], {"not_train": len(source["rows"]) - len(train),
+                                                        "excluded": 5})
+        self.assertGreater(len(site.split("heldout")), 0)
+        self.assertGreater(len(site.split("train")), len(site.split("heldout")))
+        self.assertEqual(site.index["byo"]["check_rows"], len(site.split("heldout")))
+        row = site.rows[0]
+        self.assertEqual(site.row_tokens(row, row["lo"], row["hi"]).tolist(), self.truth[row["name"]]["ids"])
+        output = self.root / "byo-run"
+        command = self.cmd(output, "--steps", "10", "--eval-every", "10", "--checkpoint-every", "10", ranks=1)
+        command[command.index("--capture-index") + 1] = args[1]
+        self.run_cmd(command)
+        records = [json.loads(line) for line in (output / "train.jsonl").read_text().splitlines()]
+        self.assertEqual(records[-1]["phase"], "eval")
+        self.assertEqual(records[-1]["rows"], len(site.split("heldout")))
+
 
 class Fp8StorageTests(unittest.TestCase, CaptureFixture):
     """FP8 e4m3 storage (round 2): codec, in-place conversion, mixed BF16/FP8 index and reads."""

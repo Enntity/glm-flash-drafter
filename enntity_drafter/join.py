@@ -52,6 +52,7 @@ TRAINING_KEYS = {"lr": float, "warmup": int, "min_lr_ratio": float, "anchors": i
                  "beta1": float, "beta2": float, "clip": float, "grad_accum": int, "crop": int}
 FINAL = ("accepted", "merged", "quarantined")
 CHECK_FRACTION = 0.05   # rows of a shard kept out of training as the public self-check set
+CHECK_ROWS_MAX = 64     # ... at most this many rows of a large bring-your-own index
 CANARY_ROWS = 16        # prompts of the claimed shard a recipe canary generates, captures and trains on
 
 
@@ -183,6 +184,49 @@ def synthetic_store(cfg: dict[str, Any], recipe: dict[str, Any], out: Path) -> l
     sd.write_row_store(out, chosen, capture_layers=cfg["target_layer_ids"], hidden_size=cfg["target_hidden_size"],
                        final_hidden="pre-final-norm", target={"name": "synthetic-recipe"})
     return ["--features", str(out)]
+
+
+def byo_capture_index(index_path: Path, out: Path, exclude: list[Path] = ()) -> list[str]:
+    """Bring-your-own capture index -> the site's own index under ``out`` (the capture files are read in place).
+
+    Rows the source index does not mark ``train`` (its own held-out, pilot rows) and rows whose name, id or prompt id
+    is listed in an ``exclude`` file (JSONL ``{"id": ...}``, for example an operator's private held-out ids that
+    live on the same disks) are dropped: the site never trains or self-checks on them.  The public check split is
+    re-carved from the remaining rows by the same hash rule as recipe shards, at most ``CHECK_ROWS_MAX`` rows.
+    Returns trainer data args (``--capture-index``; the caller adds ``--capture-root``)."""
+
+    import hashlib
+
+    from .capture_io import _norm_name
+
+    raw = Path(index_path).read_bytes()
+    index = json.loads(raw)
+    excluded = {_norm_name(str(json.loads(line)["id"])) for path in exclude
+                for line in Path(path).read_text().splitlines() if line.strip()}
+    keep, dropped = [], {"not_train": 0, "excluded": 0}
+    for row in index["rows"]:
+        if row.get("split") != "train":
+            dropped["not_train"] += 1
+        elif excluded & {_norm_name(str(row.get(k))) for k in ("name", "id", "prompt_id") if row.get(k) is not None}:
+            dropped["excluded"] += 1
+        else:
+            keep.append({k: v for k, v in row.items() if k != "rank"})
+    fraction = min(CHECK_FRACTION, CHECK_ROWS_MAX / max(len(keep), 1))
+    for row in keep:
+        row["split"] = "heldout" if _carved(str(row["id"]), fraction) else "train"
+    tokens = (Path(index_path).parent / index["tokens_file"]).resolve()
+    site = {k: v for k, v in index.items() if k not in ("rows", "world", "copy_lists", "skipped_rows")}
+    site.update(rows=keep, tokens_file=str(tokens), byo={
+        "source_index_sha256": hashlib.sha256(raw).hexdigest(), "dropped": dropped,
+        "exclude_sha256": [hashlib.sha256(Path(p).read_bytes()).hexdigest() for p in exclude],
+        "check_rows": sum(r["split"] == "heldout" for r in keep)})
+    out.mkdir(parents=True, exist_ok=True)
+    temporary = out / "index.json.tmp"
+    temporary.write_text(json.dumps(site))
+    temporary.replace(out / "index.json")
+    say(f"bring-your-own index: {len(keep)} rows ({site['byo']['check_rows']} as the public check set); dropped "
+        f"{dropped['not_train']} not marked train and {dropped['excluded']} excluded")
+    return ["--capture-index", str(out / "index.json")]
 
 
 def _run(cmd: list[str], log: Path, env: dict[str, str] | None = None) -> None:
@@ -327,7 +371,8 @@ class Site:
         if self.opts.mode == "byo":
             if self.opts.byo_features:
                 return ["--features", str(self.opts.byo_features)]
-            return ["--capture-index", str(self.opts.byo_capture_index), "--capture-root", str(self.opts.byo_capture_root)]
+            return [*byo_capture_index(self.opts.byo_capture_index, self.work / "byo-index", self.opts.byo_exclude_ids),
+                    "--capture-root", str(self.opts.byo_capture_root)]
         shard, recipe = cycle["shard"], dict(cycle["shard"]["recipe"])
         synthetic = recipe["builder"] == "synthetic"
         out = self.inside(self.work / "data" / (self.shard_id(shard) + ("-canary" if cycle["canary"] else "")))
@@ -807,6 +852,9 @@ def build_parser() -> argparse.ArgumentParser:
         q.add_argument("--byo-features", type=Path, help="byo: your enntity.drafter_rows/v1 store")
         q.add_argument("--byo-capture-index", type=Path, help="byo: your capture index.json")
         q.add_argument("--byo-capture-root", type=Path)
+        q.add_argument("--byo-exclude-ids", type=Path, action="append", default=[],
+                       help="byo: JSONL of row ids ({\"id\": ...}) this site must never train or self-check on, for "
+                            "example private held-out rows on the same disks; repeatable")
         q.add_argument("--tag", default=None, help="byo: an opaque label for your data (shown to the operator)")
         q.add_argument("--seed", type=int, default=20261014, help="byo: trainer seed")
         q.add_argument("--gpus", type=int, default=1, help="local GPUs for training (one GB10 is enough)")
@@ -856,6 +904,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if opts.mode == "byo" and not (opts.byo_features or (opts.byo_capture_index and opts.byo_capture_root)):
             raise JoinError("--mode byo needs --byo-features or --byo-capture-index with --byo-capture-root")
+        if opts.byo_exclude_ids and not opts.byo_capture_index:
+            raise JoinError("--byo-exclude-ids applies to --byo-capture-index")
         if opts.cmd == "setup":
             bad = False
             for check, status, detail in preflight(opts):

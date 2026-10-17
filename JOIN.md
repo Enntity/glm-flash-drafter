@@ -47,7 +47,15 @@ expired: ask the operator for a new one.
   (default). The site claims an Enntity shard recipe, generates teacher text and captures it locally.
 - Your own captured data (an `enntity.drafter_rows/v1` store or a capture index): **bring-your-own mode**,
   `--mode byo --byo-features DIR` (or `--byo-capture-index FILE --byo-capture-root DIR`), optionally
-  `--tag <label>`. Your data never leaves the machine.
+  `--tag <label>`. Your data never leaves the machine. Nothing is generated or captured in this mode.
+
+With a capture index (for example one built by `python -m enntity_drafter.capture_io index` over captures you
+already have), the client writes its own index under `<work>/byo-index/` and reads the capture files in place:
+only rows your index marks `train` are used; rows it marks held-out are left alone; up to 64 of the remaining rows
+(a fixed hash carve, as in recipe shards) become the public check set the self-check evaluates; and rows whose
+name, id or prompt id is listed in a `--byo-exclude-ids FILE` (JSONL `{"id": ...}`, repeatable) are never trained or
+evaluated, for example an operator's private held-out rows that sit on the same disks. The run log prints how many
+rows were kept and dropped.
 
 Recipe mode also needs: `--teacher DIR` (your GLM-5.3-Flash, for example `nvidia/GLM-5.3-Flash-NVFP4`),
 `--tokenizer-dir DIR` (the same directory), an OpenAI-compatible GLM-5.3-Flash endpoint (`--teacher-url URL`, or an

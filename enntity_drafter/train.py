@@ -78,8 +78,8 @@ def init_distributed(device_type: str) -> tuple[int, int, torch.device]:
     if device_type == "cuda":
         torch.cuda.set_device(local_rank)
         device = torch.device("cuda", local_rank)
-    else:
-        device = torch.device("cpu")
+    else:   # cpu, or mps (Apple GPU: evaluation only, e.g. a validator on a Mac; fp32, no autocast)
+        device = torch.device(device_type)
     if world > 1 and not dist.is_initialized():
         dist.init_process_group("nccl" if device_type == "cuda" else "gloo",
                                 timeout=dt.timedelta(minutes=30))
@@ -823,7 +823,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--agreement-mask", default="off",
                    help="capture: drop supervised slots by decode-vs-prefill agreement: off | argmax | minprob:<p>")
     p.add_argument("--output", type=Path, required=True)
-    p.add_argument("--device", choices=["cpu", "cuda"], default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--device", choices=["cpu", "cuda", "mps"], default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--attn", choices=["eager", "sdpa", "simple_flex_attention", fp.PACKED_ATTN, fp.FLEX_ATTN],
                    default="eager",
                    help=f"{fp.PACKED_ATTN}: exact block-sparse attention (gathered windows, masked SDPA per anchor "

@@ -349,6 +349,19 @@ class TrainingTests(unittest.TestCase, Fixture):
         print(f"\nsdpa vs eager held-out loss after 20 steps: {runs['sdpa'][-1]['loss']:.6f} vs "
               f"{runs['eager'][-1]['loss']:.6f}")
 
+    @unittest.skipUnless(torch.backends.mps.is_available(), "needs an Apple GPU (MPS)")
+    def test_mps_eval_matches_cpu(self):
+        """--device mps (a validator on a Mac) gives the same held-out eval as the CPU."""
+
+        evals = {}
+        for device in ("cpu", "mps"):
+            output = self.root / f"eval-{device}"
+            self.run_cmd(self.train_cmd(output, "--eval-only", "--eval-every", "1", "--attn", "sdpa",
+                                        "--device", device, ranks=1))
+            evals[device] = last_eval(output / "train.jsonl")
+        self.assertAlmostEqual(evals["cpu"]["loss"], evals["mps"]["loss"], delta=1e-4 * abs(evals["cpu"]["loss"]))
+        self.assertAlmostEqual(evals["cpu"]["eal"], evals["mps"]["eal"], delta=1e-3)
+
     def test_selector_prefix_objective_learns(self):
         output = self.root / "prefix"
         self.run_cmd(self.train_cmd(output, "--steps", "200", "--eval-every", "100", "--checkpoint-every", "200",
