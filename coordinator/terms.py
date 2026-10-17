@@ -66,6 +66,13 @@ def sign_attestation(token: str, delta: dict[str, Any]) -> dict[str, Any]:
     return {"version": ATTESTATION_VERSION, "statement_sha256": ATTESTATION_SHA256, "signature": mac.hexdigest()}
 
 
+def global_message(version: int, sha256: str) -> bytes:
+    """What the operator's ed25519 key signs for every published global (sites verify it with the key they
+    pinned when they registered)."""
+
+    return f"enntity-drafter-global|v1|{int(version)}|{sha256}".encode()
+
+
 def verify_attestation(stored_token_hash: str, delta: dict[str, Any], attestation: dict[str, Any]) -> bool:
     if not isinstance(attestation, dict) or attestation.get("statement_sha256") != ATTESTATION_SHA256:
         return False

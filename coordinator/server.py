@@ -75,6 +75,9 @@ class Handler(BaseHTTPRequestHandler):
               content_type: str = "application/json") -> None:
         body = b"" if payload is None else (payload if isinstance(payload, bytes) else
                                             json.dumps(payload, separators=(",", ":")).encode())
+        if not self.consumed:   # an unread request body must never be parsed as the next request (smuggling)
+            self.close_connection = True
+            headers = {**(headers or {}), "Connection": "close"}
         self.send_response(status)
         for key, value in {**SECURITY_HEADERS, **(headers or {})}.items():
             self.send_header(key, value)
@@ -92,6 +95,7 @@ class Handler(BaseHTTPRequestHandler):
         if length > MAX_JSON:
             raise ApiError(413, "too_large", "request body too large")
         raw = self.rfile.read(length) if length else b"{}"
+        self.consumed = True
         try:
             body = json.loads(raw or b"{}")
         except ValueError as error:
@@ -101,15 +105,26 @@ class Handler(BaseHTTPRequestHandler):
         return body
 
     def _client_key(self) -> str:
-        if self.app.trust_proxy and self.headers.get("X-Forwarded-For"):
-            return self.headers["X-Forwarded-For"].split(",")[0].strip()
-        return self.client_address[0]
+        """The peer address; behind a configured proxy, the last hop that proxy saw (the rightmost
+        X-Forwarded-For entry), which a client cannot forge."""
+
+        peer = self.client_address[0]
+        forwarded = self.headers.get("X-Forwarded-For")
+        if forwarded and peer in self.app.trusted_proxies:
+            return forwarded.split(",")[-1].strip()
+        return peer
 
     def _dispatch(self) -> None:
+        length = self.headers.get("Content-Length")
+        self.consumed = not length or length.strip() == "0"
+        if self.headers.get("Transfer-Encoding"):   # chunked bodies are not supported: never guess their end
+            self.consumed = False
         try:
             self.app.handle(self)
         except ApiError as error:
             self._send(error.status, {"error": error.code, "message": error.message})
+        except ValueError:   # a malformed number in a path or query
+            self._send(400, {"error": "bad_request", "message": "malformed request"})
         except Exception as error:  # noqa: BLE001 - never leak internals
             print(f"internal error: {error!r}", flush=True)
             self._send(500, {"error": "internal", "message": "internal error"})
@@ -120,8 +135,9 @@ class Handler(BaseHTTPRequestHandler):
 class App:
     """Route table over a :class:`Service`; ``admin`` selects the loopback admin router."""
 
-    def __init__(self, service: Service, base_path: str = "/drafter", admin: bool = False, trust_proxy: bool = False):
-        self.service, self.admin, self.trust_proxy = service, admin, trust_proxy
+    def __init__(self, service: Service, base_path: str = "/drafter", admin: bool = False):
+        self.service, self.admin = service, admin
+        self.trusted_proxies = {p.strip() for p in service.config.trusted_proxies.split(",") if p.strip()}
         self.base = "/" + base_path.strip("/") if base_path.strip("/") else ""
         self.limiter = RateLimiter()
         s = service
@@ -180,6 +196,12 @@ class App:
     def handle(self, h: Handler) -> None:
         parts = urlsplit(h.path)
         path, h.query = parts.path, {k: v[0] for k, v in parse_qs(parts.query).items()}
+        if self.admin:   # loopback only, and still authenticated (and no DNS-rebinding Host)
+            host = (h.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
+            if host not in ("127.0.0.1", "localhost", "::1"):
+                raise ApiError(403, "bad_host", "admin requests must address the loopback interface")
+            auth = h.headers.get("Authorization", "")
+            self.service.check_admin(auth[7:].strip() if auth.startswith("Bearer ") else None)
         if not self.admin:
             if self.base and path == self.base and h.command in ("GET", "HEAD"):   # relative links need the slash
                 return h._send(301, b"", {"Location": self.base + "/"}, "text/plain")
@@ -215,6 +237,7 @@ class App:
     def _blob(self, h: Handler, token: str) -> None:
         length = int(h.headers["Content-Length"]) if h.headers.get("Content-Length") else None
         status, headers, payload = self.service.storage.handle_blob(h.command, token, h.rfile, length)
+        h.consumed = h.consumed or (h.command == "PUT" and status == 200)
         if isinstance(payload, Path):
             h.send_response(status)
             h.send_header("Content-Type", "application/octet-stream")
@@ -229,7 +252,11 @@ class App:
 
 
 def _int(value: str | None) -> int | None:
-    return int(value) if value not in (None, "") else None
+    if value in (None, ""):
+        return None
+    if not str(value).isdigit():
+        raise ApiError(400, "bad_request", "expected a non-negative integer")
+    return int(value)
 
 
 def make_server(app: App, host: str, port: int) -> ThreadingHTTPServer:

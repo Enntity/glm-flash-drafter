@@ -69,6 +69,8 @@ def main(argv: list[str] | None = None) -> None:
     q.add_argument("delta_id")
     q.add_argument("decision", choices=["accept", "reject"])
     q.add_argument("--weight-factor", type=float, default=1.0)
+    sub.add_parser("admin-token", help="issue a new admin API token (printed once; replaces the old one)")
+    sub.add_parser("maintenance", help="abort abandoned uploads, purge expired delta objects, retire globals")
     q = sub.add_parser("audit")
     q.add_argument("--limit", type=int, default=100)
     args = p.parse_args(argv)
@@ -76,13 +78,27 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.cmd == "serve":
         env = os.environ
-        public = make_server(App(service, env.get("DRAFTER_BASE_PATH", "/drafter"),
-                                 trust_proxy=env.get("DRAFTER_TRUST_PROXY") == "1"),
+        public = make_server(App(service, env.get("DRAFTER_BASE_PATH", "/drafter")),
                              env.get("DRAFTER_HOST", "0.0.0.0"), int(env.get("DRAFTER_PORT", "8080")))
         admin = make_server(App(service, admin=True), "127.0.0.1", int(env.get("DRAFTER_ADMIN_PORT", "8081")))
+        token_file = Path(env.get("DRAFTER_ADMIN_TOKEN_FILE", "/data/admin-token"))
+        if service.get_setting("admin_token_hash") is None:   # first start: an admin token for the loopback API
+            token_file.touch(mode=0o600)
+            token_file.write_text(service.issue_admin_token() + "\n")
+            print(f"coordinator: admin API token written to {token_file}", flush=True)
         import threading
+        import time
+
+        def maintain() -> None:
+            while True:
+                try:
+                    print(f"maintenance: {json.dumps(service.maintenance())}", flush=True)
+                except Exception as error:  # noqa: BLE001 - keep serving
+                    print(f"maintenance failed: {error!r}", flush=True)
+                time.sleep(600)
 
         threading.Thread(target=admin.serve_forever, daemon=True).start()
+        threading.Thread(target=maintain, daemon=True).start()
         print(f"coordinator: public :{public.server_address[1]}, admin 127.0.0.1:{admin.server_address[1]}",
               flush=True)
         public.serve_forever()
@@ -106,6 +122,10 @@ def main(argv: list[str] | None = None) -> None:
         result = service.set_setting(args.key, json.loads(text))
     elif args.cmd == "get":
         result = service.get_setting(args.key)
+    elif args.cmd == "admin-token":
+        result = {"token": service.issue_admin_token()}
+    elif args.cmd == "maintenance":
+        result = service.maintenance()
     elif args.cmd == "release":
         result = service.release_held(args.delta_id, args.decision, args.weight_factor)
     else:

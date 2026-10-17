@@ -117,8 +117,8 @@ stops every rank cleanly when host MemAvailable falls below it;
 
 Workers take `--inner-steps` H independent AdamW steps (own optimizer state, no gradient all-reduce between
 workers), then exchange `delta = global - local` and apply an outer step on the average. Defaults: plain
-averaging (`--outer-lr 1 --outer-momentum 0`), bf16 deltas (`--delta-dtype fp32|bf16|int8`, int8 = absmax scale per
-1,024 values). The global weights are bitwise identical on every worker, evaluations see them, and checkpoints
+averaging (`--outer-lr 1 --outer-momentum 0`), int8 deltas (`--delta-dtype int8|bf16|fp32`, int8 = absmax scale per
+1,024 values, about 0.8% error on a real delta). The global weights are bitwise identical on every worker, evaluations see them, and checkpoints
 resume exactly, mid-round included.
 
 | `--diloco-transport` | workers | |
@@ -129,7 +129,7 @@ resume exactly, mid-round included.
 
 `--start-weights FILE` starts the body from a weights file (the coordinator's global weights format,
 scratch-stamped); `--eval-only` evaluates it on the held-out set and exits (the validator's eval).
-`--eval-every 0` disables evaluation. With the full model a bf16 delta is 2.34 GB per site per sync.
+`--eval-every 0` disables evaluation. With the full model an int8 delta is 1.18 GB per site per sync (bf16: 2.34 GB).
 
 ## Performance (`enntity_drafter.fastpath`, every piece opt-in)
 

@@ -16,7 +16,7 @@ services:
     environment:
       DRAFTER_PUBLIC_URL: ${DRAFTER_PUBLIC_URL:?set DRAFTER_PUBLIC_URL, e.g. https://example.org/drafter}
       DRAFTER_BASE_PATH: ${DRAFTER_BASE_PATH:-/drafter}
-      DRAFTER_TRUST_PROXY: "1"
+      DRAFTER_TRUSTED_PROXIES: ${DRAFTER_TRUSTED_PROXIES:-}   # your proxy's address as the container sees it
       DRAFTER_STORAGE: ${DRAFTER_STORAGE:-local}
       DRAFTER_BUCKET: ${DRAFTER_BUCKET:-}
       DRAFTER_S3_ENDPOINT: ${DRAFTER_S3_ENDPOINT:-}

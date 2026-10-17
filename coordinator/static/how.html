@@ -66,7 +66,10 @@
     servers. Site tokens are stored only as hashes.</li>
     <li>Administrative actions are available only on the server's loopback interface and are recorded in an audit
     log (registrations, invite use, accepts and rejects, revocations).</li>
-    <li>Weights and deltas move directly between sites and object storage through short-lived signed URLs.</li>
+    <li>Weights and deltas move directly between sites and object storage through short-lived signed URLs. Every
+    published global is signed with the operator's key, which sites pin when they register.</li>
+    <li>Sites learn only a verdict and a reason code, never held-out scores; the public curve is per group,
+    rounded and delayed.</li>
     <li>A drafter cannot change GLM-5.3-Flash's output under greedy verification; a bad drafter can only make
     decoding slower, which the held-out checks are there to catch.</li>
   </ul>

@@ -20,7 +20,7 @@ Background: [docs/volunteer.md](docs/volunteer.md). Only weight deltas and count
 
 ```
 python3 -m venv .venv && . .venv/bin/activate
-pip install 'torch>=2.11,<2.13' numpy safetensors transformers pyyaml tokenizers jinja2
+pip install 'torch>=2.11,<2.13' numpy safetensors transformers cryptography pyyaml tokenizers jinja2
 bash scripts/install_speculators.sh
 pip install -e .
 drafter-join --help
@@ -37,7 +37,8 @@ drafter-join redeem '<invite link>' --accept-terms --name "<display name>"
 ```
 
 Omit `--name` to appear as "anonymous". Check: it prints `registered as ...; token saved to
-~/.enntity-drafter/config.json (mode 0600)`. An `invite_invalid` error means the link was used, revoked or
+~/.enntity-drafter/config.json (mode 0600)`. The config also pins the network's publishing key; every global the
+site downloads must carry that key's signature. An `invite_invalid` error means the link was used, revoked or
 expired: ask the operator for a new one.
 
 ## 3. Decide the mode

@@ -861,8 +861,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     "averaging, the default; OpenDiLoCo used 0.7 with Nesterov momentum 0.9)")
     lo.add_argument("--outer-momentum", type=float, default=0.0)
     lo.add_argument("--outer-nesterov", action=argparse.BooleanOptionalAction, default=True)
-    lo.add_argument("--delta-dtype", choices=dl.DELTA_DTYPES, default="bf16",
-                    help="wire dtype of the deltas (int8: absmax scale per 1024 values)")
+    lo.add_argument("--delta-dtype", choices=dl.DELTA_DTYPES, default="int8",
+                    help="wire dtype of the deltas (int8, the default: absmax scale per 1024 values, 1.18 GB for the "
+                         "full model, ~0.8%% error; bf16: 2.34 GB)")
     lo.add_argument("--diloco-fragment-mb", type=int, default=512, help="fp32 MB per exchanged fragment")
     lo.add_argument("--diloco-transport", choices=["group", "dir", "external"], default="group",
                     help="group: every rank of this torchrun world is a worker; dir: every site (its own torchrun "

@@ -48,7 +48,10 @@ class Thresholds:
     norm_factor: float = 4.0       # RMS must lie within [median / f^2, median * f] of accepted deltas ...
     history_min: int = 3           # ... once this many were accepted
     stale_decay: float = 0.5       # merge weight factor per version of staleness
-    token_factor: float = 2.0      # self-reported tokens count up to this x the median of accepted deltas
+    token_factor: float = 2.0      # a site's self-reported tokens count up to this x the median site of the round
+    min_token_sites: int = 3       # with fewer sites in a round, every site weighs the same
+    near_duplicate: float = 0.995  # cosine above which two deltas of a round count as copies
+    gate_drop: float = 0.01        # a merged global may score at most this much below the best published one
 
 
 class CheckFailed(Exception):
@@ -221,10 +224,19 @@ def judge(base: dict[str, float], candidate: dict[str, float], thresholds: Thres
     """(decision accept|reduce|hold|reject, code, message, relative drop per group).  Decided on groups only;
     per-category buckets (names with a dot) are reported, not judged (too few rows to decide on)."""
 
-    drops = {g: (base[g] - candidate[g]) / base[g] for g in base if g in candidate and base[g] > 0}
-    groups = {g: d for g, d in drops.items() if "." not in g}
-    if not groups:
-        return "hold", "no_metrics", "no held-out group to judge on", drops
+    judged = [g for g in base if "." not in g]
+    if not judged:
+        return "hold", "no_metrics", "no held-out group to judge on", {}
+    for g in judged:   # fail closed: every base group must be scored, and every score must be a finite number
+        value, reference = candidate.get(g), base[g]
+        if not isinstance(value, (int, float)) or not math.isfinite(value):
+            return "reject", "heldout_invalid", f"held-out group {g} has no finite score", {}
+        if not isinstance(reference, (int, float)) or not math.isfinite(reference) or reference <= 0:
+            return "reject", "heldout_invalid", f"base score of held-out group {g} is not a positive number", {}
+    drops = {g: (base[g] - candidate[g]) / base[g] for g in base
+             if isinstance(candidate.get(g), (int, float)) and math.isfinite(candidate[g])
+             and isinstance(base[g], (int, float)) and math.isfinite(base[g]) and base[g] > 0}
+    groups = {g: drops[g] for g in judged}
     worst_group = max(groups, key=groups.get)
     worst = groups[worst_group]
     detail = f"{worst_group}: eal {base[worst_group]:.4f} -> {candidate[worst_group]:.4f} ({-worst:+.2%})"

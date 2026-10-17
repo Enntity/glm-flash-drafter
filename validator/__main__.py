@@ -49,6 +49,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--reject-drop", type=float, default=Thresholds.reject_drop)
     p.add_argument("--borderline", choices=["reduce", "hold"], default="reduce")
     p.add_argument("--interval", type=float, default=60)
+    p.add_argument("--signing-key", type=Path, default=None,
+                   help="ed25519 private key (hex seed file) that signs every published global; created by init if "
+                        "missing")
     a = p.parse_args(argv)
     cfg = sm.load_config(a.config)
     eval_args = ["--config", str(a.config), "--teacher", str(a.teacher), *shlex.split(a.eval_args)]
@@ -60,12 +63,22 @@ def main(argv: list[str] | None = None) -> None:
         heldout_manifest = a.heldout_capture_index
     heldout_id = hashlib.sha256(heldout_manifest.read_bytes()).hexdigest()[:16]   # rotation changes it
     requirements = {"trainer": TRAINER_VERSION, "config_sha256": dl.config_sha256(cfg)}
+    signing_key = None
+    if a.signing_key is not None:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+        if not a.signing_key.is_file():
+            if a.cmd != "init":
+                p.error(f"--signing-key {a.signing_key} does not exist")
+            a.signing_key.touch(mode=0o600)
+            a.signing_key.write_text(Ed25519PrivateKey.generate().private_bytes_raw().hex() + "\n")
+        signing_key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(a.signing_key.read_text().strip()))
     validator = Validator(
         ApiClient(a.coordinator, a.token_file.read_text().strip()), a.workdir,
         lambda path: metrics_of(evaluate(path, eval_args, inprocess=False)), requirements=requirements,
         thresholds=Thresholds(hold_drop=a.hold_drop, reject_drop=a.reject_drop, borderline=a.borderline),
         publish_dtype=a.publish_dtype, min_deltas=a.min_deltas, min_round_s=a.min_round_s,
-        round_timeout_s=a.round_timeout_s, heldout_id=heldout_id)
+        round_timeout_s=a.round_timeout_s, heldout_id=heldout_id, signing_key=signing_key)
     if a.cmd == "init":
         if a.from_checkpoint is None:
             p.error("init needs --from-checkpoint (a fresh init: train.py --lr 0 --steps 1 --stop-after 1)")
@@ -76,6 +89,10 @@ def main(argv: list[str] | None = None) -> None:
         validator.bootstrap({k: v.float() for k, v in params.items()}, stamp)
         print("Version 0 published. Pin the network to this trainer and config (coordinator host):")
         print("  python -m coordinator set requirements '" + json.dumps(requirements) + "'")
+        if signing_key is not None:
+            public = signing_key.public_key().public_bytes_raw().hex()
+            print("Publish the signing key (sites pin it when they register):")
+            print(f"  python -m coordinator set publish_key '\"{public}\"'")
         return
     while True:
         print(json.dumps(validator.step()), flush=True)

@@ -20,6 +20,10 @@ Upload plans returned to clients:
   ``init_headers`` (the ``Location`` response header is the session URL), PUT chunks with ``Content-Range``,
   query progress with ``Content-Range: bytes */<size>``.
 
+Abandoned uploads are aborted by ``abort_upload`` (the coordinator's maintenance).  GCS resumable sessions cannot be
+cancelled without their URL, which only the uploader holds; they lapse on their own, and the signed initiation is
+short-lived and pinned to "object must not exist" (``x-goog-if-generation-match: 0``), so nothing is overwritten.
+
 Content: sizes are checked here after completion; SHA-256 of every file is declared by the uploader and checked by
 whoever downloads it (validator for deltas, sites for globals).
 """
@@ -91,8 +95,9 @@ class LocalStorage:
 
     name = "local"
 
-    def __init__(self, root: str | Path, public_url: str, secret: bytes | None = None, part_size: int = PART_SIZE):
-        self.root, self.public_url = Path(root), public_url.rstrip("/")
+    def __init__(self, root: str | Path, public_url: str, secret: bytes | None = None, part_size: int = PART_SIZE,
+                 min_free_bytes: int = 512 * 2**20):
+        self.root, self.public_url, self.min_free_bytes = Path(root), public_url.rstrip("/"), min_free_bytes
         self.secret = secret or secrets.token_bytes(32)
         self.part_size = part_size
         (self.root / ".uploads").mkdir(parents=True, exist_ok=True)
@@ -161,6 +166,9 @@ class LocalStorage:
         shutil.rmtree(folder)
         return {"size": size}
 
+    def abort_upload(self, key: str, backend: dict[str, Any]) -> None:
+        shutil.rmtree(self.root / ".uploads" / backend.get("upload_id", "-"), ignore_errors=True)
+
     def download_url(self, key: str, expires_s: int) -> str:
         return self._sign({"op": "get", "key": check_key(key), "exp": time.time() + expires_s})
 
@@ -186,6 +194,8 @@ class LocalStorage:
             folder = self.root / ".uploads" / claims["upload"]
             if not folder.is_dir():
                 return 404, {}, b"no such upload"
+            if shutil.disk_usage(self.root).free < length + self.min_free_bytes:
+                return 507, {}, b"insufficient storage"
             part = folder / f"part-{claims['n']:05d}"
             temporary = part.with_name(part.name + f".{secrets.token_hex(4)}.tmp")
             digest, left = hashlib.md5(), length
@@ -314,6 +324,10 @@ class S3Storage:
             raise StorageError(f"stored size {stored} != declared {size}")
         return {"size": size}
 
+    def abort_upload(self, key, backend):
+        if backend.get("upload_id"):
+            self._call("DELETE", key, {"uploadId": backend["upload_id"]})
+
     def download_url(self, key, expires_s):
         return self.presign("GET", key, expires_s)
 
@@ -360,10 +374,14 @@ class GCSStorage:
         signature = self.key.sign(to_sign.encode(), padding.PKCS1v15(), hashes.SHA256()).hex()
         return f"{self.scheme}://{self.netloc}{path}?{qs}&X-Goog-Signature={signature}"
 
+    INIT_EXPIRY_S = 900   # the signed session initiation is short-lived
+
     def plan_upload(self, key, size, expires_s):
-        headers = {"x-goog-resumable": "start", "x-goog-content-length-range": f"{size},{size}"}
+        headers = {"x-goog-resumable": "start", "x-goog-content-length-range": f"{size},{size}",
+                   "x-goog-if-generation-match": "0"}   # create only: never overwrite an existing object
         return {"protocol": "gcs-resumable", "backend": {}, "chunk_size": self.chunk_size,
-                "init_url": self.sign("POST", key, expires_s, headers), "init_headers": headers}
+                "init_url": self.sign("POST", key, min(expires_s, self.INIT_EXPIRY_S), headers),
+                "init_headers": headers}
 
     def refresh_upload(self, key, size, backend, numbers, expires_s):
         plan = self.plan_upload(key, size, expires_s)
@@ -377,6 +395,9 @@ class GCSStorage:
                 self.delete(key)
             raise StorageError(f"stored size {stored} != declared {size}")
         return {"size": size}
+
+    def abort_upload(self, key, backend):
+        return None   # sessions lapse; see the module docstring
 
     def download_url(self, key, expires_s):
         return self.sign("GET", key, expires_s)

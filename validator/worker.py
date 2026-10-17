@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import math
+import urllib.error
 import random
 import shutil
 import time
@@ -26,6 +27,7 @@ from typing import Any, Callable
 
 import torch
 
+from coordinator import terms
 from coordinator.client import ApiClient, ApiError, download, sha256_file, upload_file
 from enntity_drafter import diloco as dl
 from enntity_drafter.guard import guarded_safe_open
@@ -35,23 +37,26 @@ from enntity_drafter.validation import (
 )
 
 
-def merge_weights(items: list[dict[str, Any]], current: int, thresholds: Thresholds,
-                  token_cap: float | None = None) -> list[float]:
-    """Merge weight per accepted delta: tokens (self-reported, so capped at ``token_cap``) x borderline factor x
-    stale_decay ** versions behind."""
+def merge_weights(items: list[dict[str, Any]], current: int, thresholds: Thresholds) -> list[float]:
+    """Merge weight per accepted delta.  Tokens are self-reported, so they are trusted only across sites: each site's
+    total for the round is capped at ``token_factor`` x the median site total (one value per site), and with fewer
+    than ``min_token_sites`` sites every site weighs the same.  A site's budget is shared by its deltas in
+    proportion to their tokens, then multiplied by the borderline factor and ``stale_decay ** versions behind``."""
 
-    cap = token_cap or float("inf")
-    return [min(max(float(item["meta"].get("tokens") or 0.0), 1.0), cap)
+    def tokens(item: dict[str, Any]) -> float:
+        return max(float(item["meta"].get("tokens") or 0.0), 1.0)
+
+    totals: dict[str, float] = {}
+    for item in items:
+        totals[item["site"]] = totals.get(item["site"], 0.0) + tokens(item)
+    if len(totals) >= thresholds.min_token_sites:
+        median = sorted(totals.values())[len(totals) // 2]
+        budget = {site: min(total, thresholds.token_factor * median) for site, total in totals.items()}
+    else:
+        budget = dict.fromkeys(totals, 1.0)
+    return [budget[item["site"]] * tokens(item) / totals[item["site"]]
             * float(item["verdict"].get("weight_factor") or 1.0)
             * thresholds.stale_decay ** max(0, current - item["base_version"]) for item in items]
-
-
-def token_cap(history: list[float], thresholds: Thresholds) -> float | None:
-    """A delta weighs at most ``token_factor`` x the median tokens of accepted deltas (once there is history)."""
-
-    if len(history) < thresholds.history_min:
-        return None
-    return sorted(history)[len(history) // 2] * thresholds.token_factor
 
 
 def _decode(handle, name: str, shape: tuple[int, ...], dtype: str) -> torch.Tensor:
@@ -132,7 +137,7 @@ class Validator:
                  outer_momentum: float = 0.0, outer_nesterov: bool = True, heldout_id: str = "",
                  keep_local: int = 9, replayer: Callable[[dict[str, Any], Path], Path] | None = None,
                  spot_check_rate: float = 0.0, spot_cosine: float = 0.5, clock: Callable[[], float] = time.time,
-                 log: Callable[[str], None] = print):
+                 log: Callable[[str], None] = print, signing_key: Any = None):
         self.api, self.workdir, self.evaluate = api, Path(workdir), evaluate
         self.requirements = dict(requirements or {})
         self.thresholds, self.version, self.publish_dtype = thresholds or Thresholds(), version, publish_dtype
@@ -141,6 +146,7 @@ class Validator:
         self.heldout_id, self.keep_local, self.clock, self.log = heldout_id, keep_local, clock, log
         self.replayer, self.spot_check_rate, self.spot_cosine = replayer, spot_check_rate, spot_cosine
         self.rng = random.Random(0)
+        self.signing_key = signing_key   # cryptography Ed25519PrivateKey: signs every published global
         for sub in ("versions", "inbox", "tmp"):
             (self.workdir / sub).mkdir(parents=True, exist_ok=True)
         self.state_path = self.workdir / "state.json"
@@ -168,8 +174,10 @@ class Validator:
         self._save()
         return path
 
-    def metrics(self, version: int, path: Path) -> dict[str, float]:
-        cache = self.workdir / "versions" / f"v{version:06d}.eval.json"
+    def metrics(self, sha256: str, path: Path) -> dict[str, float]:
+        """Held-out metrics of a weights file, cached by its content hash and the held-out set."""
+
+        cache = self.workdir / "versions" / f"{sha256[:24]}.eval.json"
         if cache.is_file():
             saved = json.loads(cache.read_text())
             if saved.get("heldout_id") == self.heldout_id:
@@ -185,7 +193,8 @@ class Validator:
         return reply
 
     def bootstrap(self, weights: dict[str, torch.Tensor], stamp: dict[str, Any]) -> int:
-        """Publish version 0 from fp32 tensors (e.g. a trainer checkpoint's params)."""
+        """Publish version 0 from fp32 tensors (e.g. a trainer checkpoint's params); it is also the fixed reference
+        every later merged global is gated against."""
 
         if self.hello().get("current") is not None:
             raise RuntimeError("the coordinator already has a global version")
@@ -195,14 +204,17 @@ class Validator:
             shutil.copyfile(master, self.published(0))
         else:
             dl.save_weights(self.published(0), weights, self.publish_dtype, stamp, {"version": 0})
-        return self._publish(0, [], self.published(0))
+        metrics = self.metrics(sha256_file(self.published(0)), self.published(0))
+        self.state.update(reference_metrics=metrics, best_metrics=dict(metrics))
+        return self._publish(0, [], self.published(0), metrics)
 
-    def _publish(self, version: int, merged: list[dict[str, Any]], path: Path) -> int:
+    def _publish(self, version: int, merged: list[dict[str, Any]], path: Path, metrics: dict[str, float]) -> int:
         sha, size = sha256_file(path), path.stat().st_size
         self.state.setdefault("sha", {})[str(version)] = sha
-        metrics = self.metrics(version, path)
-        upload_key = f"version-{version}"
-        progress = self.state.setdefault("uploads", {}).setdefault(upload_key, {})
+        uploads = self.state.setdefault("uploads", {})
+        for key in [k for k in uploads if k.startswith(f"{version}-") and k != f"{version}-{sha}"]:
+            uploads.pop(key)   # progress of a different file for this version must never be reused
+        progress = uploads.setdefault(f"{version}-{sha}", {})
         if "upload_id" not in progress:
             reply = self.api.call("POST", f"/api/v1/validator/versions/{version}/upload",
                                   {"size": size, "sha256": sha, "dtype": self.publish_dtype})
@@ -211,11 +223,16 @@ class Validator:
         refresh = lambda numbers: self.api.call(   # noqa: E731
             "POST", f"/api/v1/validator/uploads/{progress['upload_id']}/refresh", {"parts": numbers})
         parts = upload_file(path, progress["plan"], refresh, progress.setdefault("transfer", {}), self._save)
-        self.api.call("POST", f"/api/v1/validator/versions/{version}/publish", {
-            "upload_id": progress["upload_id"], "parts": parts, "merged": merged, "dtype": self.publish_dtype,
-            "evals": {"metrics": metrics}, "heldout_id": self.heldout_id,
-            "norm_bounds": norm_bounds(self.state["history"], self.thresholds)})
-        self.state["uploads"].pop(upload_key, None)
+        body = {"upload_id": progress["upload_id"], "parts": parts, "merged": merged, "dtype": self.publish_dtype,
+                "evals": {"metrics": metrics}, "heldout_id": self.heldout_id,
+                "norm_bounds": norm_bounds(self.state["history"], self.thresholds)}
+        if self.signing_key is not None:
+            body["signature"] = self.signing_key.sign(terms.global_message(version, sha)).hex()
+        self.api.call("POST", f"/api/v1/validator/versions/{version}/publish", body)
+        uploads.pop(f"{version}-{sha}", None)
+        best = self.state.setdefault("best_metrics", {})
+        for group, value in metrics.items():
+            best[group] = max(best.get(group, value), value)
         self.state.update(current=version, last_merge=self.clock())
         self._save()
         self._prune(version)
@@ -229,12 +246,37 @@ class Validator:
                 path.unlink()
             elif version <= current - self.keep_local:
                 path.unlink()
+        for path in (self.workdir / "versions").glob("momentum-v*.safetensors"):
+            if int(path.name[10:16]) < current:
+                path.unlink()
 
     def step(self) -> dict[str, Any]:
         self.hello()
-        verdicts = [self.process(item) for item in self.api.call("GET", "/api/v1/validator/pending")]
+        verdicts = []
+        for item in self.api.call("GET", "/api/v1/validator/pending"):
+            try:
+                verdicts.append(self.process(item))
+            except (urllib.error.URLError, ConnectionError, TimeoutError) as error:
+                self.log(f"{item['delta_id']}: network error ({error!r}); retried after the claim times out")
+            except ApiError as error:
+                if error.code in ("not_pending", "unreachable") or error.status == 0:
+                    self.log(f"{item['delta_id']}: skipped ({error.code})")
+                    continue
+                verdicts.append(self._validator_error(item, error))
+            except Exception as error:  # noqa: BLE001 - one bad delta must not stop the loop
+                verdicts.append(self._validator_error(item, error))
         merged = self.maybe_merge()
         return {"verdicts": verdicts, "merged": merged}
+
+    def _validator_error(self, item: dict[str, Any], error: BaseException) -> dict[str, Any]:
+        """Quarantine with ``validator_error``: re-validated automatically after the next validator version bump."""
+
+        self.log(f"{item['delta_id']}: validator error {error!r}")
+        (self.workdir / "inbox" / f"{item['delta_id']}.safetensors").unlink(missing_ok=True)
+        self.api.call("POST", f"/api/v1/validator/deltas/{item['delta_id']}/verdict", {
+            "decision": "reject", "code": "validator_error", "reason": type(error).__name__,
+            "validator_version": self.version})
+        return {"delta_id": item["delta_id"], "decision": "reject", "code": "validator_error"}
 
     def process(self, item: dict[str, Any]) -> dict[str, Any]:
         claim = self.api.call("POST", f"/api/v1/validator/deltas/{item['delta_id']}/claim")
@@ -261,6 +303,9 @@ class Validator:
             except Exception as error:  # noqa: BLE001
                 raise CheckFailed("malformed", f"the delta file could not be read ({type(error).__name__})") from error
             verdict["checks"] = {"rms": stats["rms"], "max_abs": stats["max_abs"]}
+            for other in sorted((self.workdir / "inbox").glob("*.safetensors")):   # accepted, awaiting the merge
+                if other != path and cosine(path, other, base) > self.thresholds.near_duplicate:
+                    raise CheckFailed("near_duplicate", f"nearly identical to delta {other.stem} of this round")
             if (self.replayer is not None and item["mode"] == "recipe" and claim.get("recipe")
                     and (item["canary"] or self.rng.random() < self.spot_check_rate)):
                 similarity = cosine(path, self.replayer(claim, base), base)
@@ -270,7 +315,7 @@ class Validator:
                                                     f"{similarity:.2f} < {self.spot_cosine})")
             candidate_weights(base, path, candidate)
             cand = self.evaluate(candidate)
-            base_metrics = self.metrics(item["base_version"], base)
+            base_metrics = self.metrics(item["base_sha256"], base)
             decision, code, message, _ = judge(base_metrics, cand, self.thresholds)
             verdict.update(metrics=cand, base_metrics=base_metrics)
         except CheckFailed as failure:
@@ -281,9 +326,9 @@ class Validator:
                        weight_factor=self.thresholds.reduce_weight if decision == "reduce" else 1.0)
         if decision in ("accept", "reduce"):
             self.state["history"] = (self.state["history"] + [verdict["checks"]["rms"]])[-200:]
-            if not item["canary"]:
-                self.state["tokens"] = (self.state.get("tokens", []) + [float(item["meta"].get("tokens") or 0)])[-200:]
             self._save()
+            if item["canary"]:   # canaries are not merged: never compare later deltas against them
+                path.unlink(missing_ok=True)
         else:
             path.unlink(missing_ok=True)   # the coordinator keeps the object (quarantine)
         self.api.call("POST", f"/api/v1/validator/deltas/{item['delta_id']}/verdict", verdict)
@@ -291,38 +336,98 @@ class Validator:
                  f"{', canary' if item['canary'] else ''}): {decision} {code or ''} {message}")
         return {"delta_id": item["delta_id"], "decision": decision, "code": code}
 
+    def _late(self, delta_id: str, decision: str, code: str, reason: str) -> None:
+        self.api.call("POST", f"/api/v1/validator/deltas/{delta_id}/verdict", {
+            "decision": decision, "code": code, "reason": reason, "validator_version": self.version})
+
     def maybe_merge(self, force: bool = False) -> int | None:
-        items = self.api.call("GET", "/api/v1/validator/mergeable")
+        """Merge accepted deltas into the next global.  The inputs (deltas and weights) are saved before merging, so
+        a crash and re-run produce the same file; the result must pass the merge gate before it is published."""
+
         current = self.hello()["current"]
-        if not items or current is None:
-            return None
-        oldest = min(item["received"] for item in items)
-        ready = len(items) >= self.min_deltas or self.clock() - oldest >= self.round_timeout_s
-        if not force and (not ready or self.clock() - self.state.get("last_merge", 0) < self.min_round_s):
+        if current is None:
             return None
         version = current["version"]
-        weights = merge_weights(items, version, self.thresholds,
-                                token_cap(self.state.setdefault("tokens", []), self.thresholds))
-        files = []
-        for item in items:
-            path = self.workdir / "inbox" / f"{item['delta_id']}.safetensors"
-            if not path.is_file():
+        plan = self.state.get("pending_merge")
+        if plan is not None and plan["version"] != version + 1:
+            plan = self.state["pending_merge"] = None   # stale (already published, or the network moved on)
+        if plan is None:
+            items = self.api.call("GET", "/api/v1/validator/mergeable")
+            if not items:
+                return None
+            oldest = min(item["received"] for item in items)
+            ready = len(items) >= self.min_deltas or self.clock() - oldest >= self.round_timeout_s
+            if not force and (not ready or self.clock() - self.state.get("last_merge", 0) < self.min_round_s):
+                return None
+            usable = []
+            for item in items:
+                path = self.workdir / "inbox" / f"{item['delta_id']}.safetensors"
+                if not path.is_file():
+                    info = self.api.call("GET", f"/api/v1/validator/deltas/{item['delta_id']}")
+                    try:
+                        download(info["url"], path, sha256=info["sha256"], size=info["size"], retries=2)
+                    except ApiError as error:
+                        if error.code not in ("download_hash", "download_size"):
+                            raise
+                        self._late(item["delta_id"], "reject", "hash_mismatch", "stored object changed after "
+                                                                                "acceptance")
+                        continue
+                usable.append(item)
+            if not usable:
+                return None
+            weights = merge_weights(usable, version, self.thresholds)
+            plan = {"version": version + 1, "parent_sha256": current["sha256"],
+                    "items": [{"delta_id": i["delta_id"], "weight": w, "site": i["site"],
+                               "base_version": i["base_version"]} for i, w in zip(usable, weights)]}
+            self.state["pending_merge"] = plan
+            self._save()   # the inputs are fixed before any output exists
+        files = [self.workdir / "inbox" / f"{item['delta_id']}.safetensors" for item in plan["items"]]
+        for item, path in zip(plan["items"], files):
+            if not path.is_file():   # re-run on a host that lost its inbox: the same bytes, hash-checked
                 info = self.api.call("GET", f"/api/v1/validator/deltas/{item['delta_id']}")
                 download(info["url"], path, sha256=info["sha256"], size=info["size"])
-            files.append(path)
         master = self.master(version)
         if not master.is_file():   # a new validator host: continue from the published copy
             shutil.copyfile(self.ensure_version(version, current["sha256"]), master)
-        meta = {"version": version + 1, "parent_sha256": current["sha256"], "merged": len(items)}
-        momentum = self.workdir / "versions" / "momentum.safetensors"
-        merge_streamed(master, list(zip(files, weights)), self.master(version + 1), self.published(version + 1),
-                       self.publish_dtype, meta, momentum_in=momentum if momentum.is_file() else None,
-                       momentum_out=self.workdir / "tmp" / "momentum.safetensors", **self.outer)
-        if self.outer["momentum"]:
-            (self.workdir / "tmp" / "momentum.safetensors").replace(momentum)
-        merged = [{"delta_id": item["delta_id"], "weight": weight, "site": item["site"],
-                   "base_version": item["base_version"]} for item, weight in zip(items, weights)]
-        published = self._publish(version + 1, merged, self.published(version + 1))
+        momentum_in = self.workdir / "versions" / f"momentum-v{version:06d}.safetensors"
+        momentum_out = self.workdir / "versions" / f"momentum-v{version + 1:06d}.safetensors"
+        merge_streamed(master, list(zip(files, [i["weight"] for i in plan["items"]])), self.master(version + 1),
+                       self.published(version + 1), self.publish_dtype,
+                       {"version": version + 1, "parent_sha256": plan["parent_sha256"], "merged": len(files)},
+                       momentum_in=momentum_in if momentum_in.is_file() else None, momentum_out=momentum_out,
+                       **self.outer)   # reads only version-keyed inputs: a re-run is idempotent
+        published = self.published(version + 1)
+        metrics = self.metrics(sha256_file(published), published)
+        gate = self._gate(metrics)
+        if gate is not None:   # refuse to publish; hold the deltas for the operator, never discard them
+            for item in plan["items"]:
+                self._late(item["delta_id"], "hold", "merge_regression", gate)
+            for path in (self.master(version + 1), published, momentum_out, *files):
+                path.unlink(missing_ok=True)
+            self.state["pending_merge"] = None
+            self._save()
+            self.log(f"merge into v{version + 1} refused: {gate}")
+            return None
+        result = self._publish(version + 1, plan["items"], published, metrics)
+        self.state["pending_merge"] = None
+        self._save()
         for path in files:
             path.unlink(missing_ok=True)
-        return published
+        return result
+
+    def _gate(self, metrics: dict[str, float]) -> str | None:
+        """None if a merged global may be published: no group more than ``gate_drop`` below the best published
+        global, and no clear regression against the fixed reference (version 0)."""
+
+        gate = Thresholds(hold_drop=self.thresholds.gate_drop, reject_drop=self.thresholds.gate_drop)
+        best = self.state.get("best_metrics")
+        if best:
+            decision, _, message, _ = judge(best, metrics, gate)
+            if decision != "accept":
+                return f"below the best published global ({message})"
+        reference = self.state.get("reference_metrics")
+        if reference:
+            decision, _, message, _ = judge(reference, metrics, self.thresholds)
+            if decision == "reject":
+                return f"below the reference global ({message})"
+        return None

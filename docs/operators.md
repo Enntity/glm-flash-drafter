@@ -15,12 +15,19 @@ DRAFTER_PUBLIC_URL=https://<your host>/drafter docker compose up -d --build
 ```
 
 - Put a TLS reverse proxy in front of `127.0.0.1:8080` and route `<base path>/*` to it with the prefix kept. Set
-  `DRAFTER_TRUST_PROXY=1` (the compose file does) so per-client rate limits use `X-Forwarded-For`; IPs are only
-  held in memory.
+  `DRAFTER_TRUSTED_PROXIES` to the proxy's address as the container sees it: only requests from it have their
+  rightmost `X-Forwarded-For` entry used as the client address for rate limits. IPs are only held in memory.
 - The public router serves the dashboard, the public JSON API, the site and validator APIs and, with the local
   backend only, signed blob transfers. **The admin API listens on 127.0.0.1:8081 inside the container and is never
-  published**; use `docker compose exec coordinator python -m coordinator <command>`, which acts on the database
-  directly.
+  published**; it also requires the admin token (written to `/data/admin-token`, mode 0600, on first start;
+  `python -m coordinator admin-token` replaces it) and a loopback `Host`. The CLI,
+  `docker compose exec coordinator python -m coordinator <command>`, acts on the database directly.
+- Maintenance runs every 10 minutes (`python -m coordinator maintenance` by hand): it aborts uploads left open for
+  more than `DRAFTER_UPLOAD_TTL_S` (24 h; S3 multipart uploads are aborted, GCS sessions lapse), deletes delta
+  objects 7 days after their merge and 30 days after quarantine (`DRAFTER_DELTA_RETENTION_S`,
+  `DRAFTER_QUARANTINE_RETENTION_S`), and retires unused globals. Each site may have 2 open uploads and 3 unmerged
+  deltas. Below `DRAFTER_MIN_FREE_BYTES` (512 MB) free on the database volume the coordinator refuses new work
+  and stops recording heartbeat history, so SQLite never runs out of space.
 - Back up the `/data` volume (SQLite in WAL mode: copy with `sqlite3 .backup` or stop the container first).
 
 Environment (credentials only as mounted files):
@@ -66,11 +73,12 @@ python -m coordinator validator --label gpu-1                  # validator token
 python -m coordinator add-shards --builder coverage --builder-args '{"seed": 31, "profile": "long", "prefix": "v1"}' \
     --generation '{"samples": 2}' --rows-per-shard 500 --total 8000
 python -m coordinator set training '{"inner_steps": 500, "steps": 10000000, "canary_steps": 20, "lr": 3e-4,
-    "warmup": 50, "min_lr_ratio": 1.0, "delta_dtype": "bf16"}'
+    "warmup": 50, "min_lr_ratio": 1.0, "delta_dtype": "int8"}'
 python -m coordinator set requirements '{"trainer": "scratch-v1", "config_sha256": "<printed by validator init>"}'
 python -m coordinator set benchmarks @bench.json               # {"columns": [...], "rows": [[...]], "note": "..."}
 python -m coordinator set wanted_notes '["long-form prose", "multilingual prose"]'
-python -m coordinator release DELTA_ID accept|reject [--weight-factor 0.5]   # held deltas
+python -m coordinator set publish_key '"<hex printed by validator init>"'   # sites pin it at registration
+python -m coordinator release DELTA_ID accept|reject [--weight-factor 0.5]   # held deltas (borderline, merge gate)
 python -m coordinator audit --limit 100
 ```
 
@@ -93,12 +101,18 @@ python -m validator init --coordinator https://<host>/drafter --token-file ~/.dr
 python -m validator run   (same flags)
 ```
 
+- `--signing-key FILE` (created by `init` if missing, keep it on the validator host only): every published global
+  is signed with this ed25519 key; `init` prints the public key to set as `publish_key`.
 - `init` publishes version 0 from a trainer checkpoint (a fresh one: `train.py ... --lr 0 --steps 1 --stop-after 1`)
   and prints the `requirements` to set on the coordinator.
 - `run` loops: re-announce its version, validate pending deltas (canaries first), merge once `--min-deltas`
   (default 2) are accepted and `--min-round-s` (default 1800) has passed since the last merge, or the oldest accepted
   delta has waited `--round-timeout-s`. The merge streams one tensor at a time; the fp32 master stays in the workdir
-  and the published copy (`--publish-dtype bf16`) goes to storage.
+  and the published copy (`--publish-dtype bf16`) goes to storage. The merge inputs (deltas and weights) are saved
+  before merging and outer momentum is kept per version, so a crash and re-run produce the same file.
+- **Merge gate.** Each merged global is evaluated on the held-out set before publishing. More than 1% below the
+  best published global on any group, or clearly below version 0, and it is not published: its deltas are held
+  (`python -m coordinator release ...` after review).
 - **The held-out set is private**: never in the repository, never on the coordinator. Build it from prompts no
   shard recipe can produce (for example builder runs with an unpublished seed) and rotate it; its manifest hash is
   recorded with every version, so a rotation is visible in the curve, and cached base scores are recomputed.

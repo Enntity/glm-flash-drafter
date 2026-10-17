@@ -16,6 +16,7 @@ import hashlib
 import json
 import re
 import secrets
+import shutil
 import sqlite3
 import threading
 import time
@@ -41,6 +42,30 @@ DELTA_META = {"tokens": (float, 0, 1e15), "steps": (int, 1, 10**9), "step_start"
               "trainer": (str, None, None), "config_sha256": (str, None, None),
               "validator_version": (str, None, None), "client": (str, None, None)}
 RECEIVED = ("pending", "validating", "accepted", "held", "quarantined", "merged")
+OPEN = ("uploading", "pending", "validating", "accepted")   # unmerged work a site has in flight
+#: What a site is told about a verdict: a code and a fixed explanation, never held-out numbers (no oracle).
+REASONS = {
+    None: "accepted",
+    "heldout_borderline": "accepted at reduced weight: the private held-out check moved slightly",
+    "heldout_regression": "the private held-out check got clearly worse with this delta",
+    "heldout_invalid": "the held-out check could not score this delta (non-finite or missing result)",
+    "norm_high": "the delta is much larger than typical accepted deltas",
+    "norm_low": "the delta is much smaller than typical accepted deltas",
+    "zero": "the delta is all zeros",
+    "non_finite": "the delta contains NaN or Inf values",
+    "layout": "the delta's tensors do not match the model",
+    "header": "the delta file header is not a valid delta",
+    "provenance": "the delta file failed the provenance check",
+    "base_mismatch": "the delta was not trained from the declared base weights",
+    "version_mismatch": "the delta was made with a different trainer or config",
+    "hash_mismatch": "the stored file differs from the declared size or SHA-256; upload it again",
+    "malformed": "the delta file could not be read",
+    "near_duplicate": "the delta is nearly identical to another delta in this round",
+    "spot_check": "replaying the recipe gave a clearly different update",
+    "merge_regression": "held for review: the merged global with this delta scored below the best published global",
+    "validator_error": "the validator failed on this delta; it is re-validated after a validator update",
+    "site_revoked": "the site's token was revoked",
+}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -88,6 +113,16 @@ class Config:
     online_s: float = 900.0
     heartbeat_s: int = 120
     merge_canaries: bool = False
+    require_canary: bool = True        # a site's first delta (and the first after a pin change) is a short canary
+    max_canary_steps: int = 50
+    max_open_uploads: int = 2          # per site: uploads started and not completed
+    max_open_deltas: int = 3           # per site: unmerged non-canary deltas (bounds one site's share of a round)
+    upload_ttl_s: float = 24 * 3600.0  # abandoned uploads are aborted after this
+    delta_retention_s: float = 7 * 86400.0        # delta objects are deleted this long after their merge
+    quarantine_retention_s: float = 30 * 86400.0  # ... and quarantined ones this long after their verdict
+    min_free_bytes: int = 512 * 2**20  # below this free space on the database volume, refuse new work
+    curve_delay_s: float = 3600.0      # the public held-out curve shows versions at least this old
+    trusted_proxies: str = ""          # comma-separated proxy addresses whose X-Forwarded-For is used
 
     @classmethod
     def from_env(cls, env: dict[str, str]) -> "Config":
@@ -131,6 +166,17 @@ class Service:
         with self._connect() as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.executescript(SCHEMA)
+            for table, column in (("deltas", "purged REAL"), ("uploads", "aborted REAL"),
+                                  ("versions", "signature TEXT")):
+                if column.split()[0] not in {r["name"] for r in db.execute(f"PRAGMA table_info({table})")}:
+                    db.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
+
+    def disk_ok(self) -> bool:
+        return shutil.disk_usage(Path(self.db_path).parent).free >= self.config.min_free_bytes
+
+    def _require_disk(self) -> None:
+        if not self.disk_ok():
+            raise ApiError(503, "low_disk", "the coordinator is low on disk; retry later")
 
     # ------------------------------------------------------------------ db helpers
     def _connect(self) -> sqlite3.Connection:
@@ -183,6 +229,23 @@ class Service:
         return site
 
     # ------------------------------------------------------------------ admin
+    def issue_admin_token(self) -> str:
+        """A new admin API token (shown once; replaces the previous one)."""
+
+        token = "dadm_" + secrets.token_urlsafe(32)
+        with self.tx() as db:
+            self._set_meta(db, "admin_token_hash", terms.token_hash(token))
+            self._audit(db, "admin.token_issued", "admin")
+        return token
+
+    def check_admin(self, token: str | None) -> None:
+        import hmac
+
+        with contextlib.closing(self._connect()) as db:
+            stored = self._meta(db, "admin_token_hash")
+        if not token or not stored or not hmac.compare_digest(terms.token_hash(token), stored):
+            raise ApiError(401, "auth_invalid", "admin token required")
+
     def issue_invite(self, label: str = "", hours: float | None = None) -> dict[str, Any]:
         code = "inv_" + secrets.token_urlsafe(18)
         expires = self.now() + 3600 * (hours if hours is not None else self.config.invite_hours)
@@ -222,7 +285,12 @@ class Service:
                 raise ApiError(404, "not_found", "no such active site")
             db.execute("UPDATE shards SET state='open', lease_site=NULL WHERE state='leased' AND lease_site="
                        "(SELECT id FROM sites WHERE public_id=?)", (public_id,))
-            self._audit(db, "token.revoked", "admin", public_id)
+            marks = ",".join("?" * len(OPEN + ("held",)))
+            held = db.execute(f"UPDATE deltas SET state='quarantined', reason_code='site_revoked', reason=?, updated=? "
+                              f"WHERE state IN ({marks}) AND merged_into IS NULL AND site_id=(SELECT id FROM sites "
+                              f"WHERE public_id=?)", (REASONS["site_revoked"], self.now(), *OPEN, "held",
+                                                       public_id)).rowcount
+            self._audit(db, "token.revoked", "admin", public_id, quarantined=held)
 
     def list_sites(self) -> list[dict[str, Any]]:
         with contextlib.closing(self._connect()) as db:
@@ -244,7 +312,7 @@ class Service:
             self._audit(db, "shards.added", "admin", f"{len(ids)}", first=ids[:1], last=ids[-1:])
         return ids
 
-    SETTABLE = ("requirements", "training", "benchmarks", "wanted_notes")
+    SETTABLE = ("requirements", "training", "benchmarks", "wanted_notes", "publish_key")
 
     def set_setting(self, key: str, value: Any, actor: str = "admin") -> None:
         if key not in self.SETTABLE + ("norm_bounds",):
@@ -278,6 +346,7 @@ class Service:
     # ------------------------------------------------------------------ sites
     def terms(self) -> dict[str, Any]:
         return {"version": terms.TERMS_VERSION, "sha256": terms.TERMS_SHA256, "text": terms.TERMS_TEXT,
+                "publish_key": self.get_setting("publish_key"),
                 "attestation": {"version": terms.ATTESTATION_VERSION, "sha256": terms.ATTESTATION_SHA256,
                                 "text": terms.ATTESTATION_TEXT}}
 
@@ -287,6 +356,7 @@ class Service:
         if display_name is not None and not DISPLAY.match(display_name):
             raise ApiError(400, "bad_display_name", "display name: 1-32 letters, digits, spaces, . ' - or _")
         token, public_id = "dsite_" + secrets.token_urlsafe(32), secrets.token_hex(6)
+        self._require_disk()
         with self.tx() as db:
             invite = db.execute("SELECT * FROM invites WHERE code_hash=?", (terms.token_hash(str(code)),)).fetchone()
             if invite is None or invite["used"] or invite["revoked"] or invite["expires"] < self.now():
@@ -313,20 +383,31 @@ class Service:
         req = self._meta(db, "requirements", {})
         return f"{req.get('trainer')}|{req.get('config_sha256')}|{self._meta(db, 'validator_version')}"
 
+    def _canary_required(self, db, site_id: int) -> bool:
+        row = db.execute("SELECT canary_key FROM sites WHERE id=?", (site_id,)).fetchone()
+        return self.config.require_canary and row["canary_key"] != self._canary_key(db)
+
+    def _open_deltas(self, db, site_id: int) -> int:
+        marks = ",".join("?" * len(OPEN))
+        return db.execute(f"SELECT COUNT(*) AS n FROM deltas WHERE site_id=? AND canary=0 AND merged_into IS NULL "
+                          f"AND state IN ({marks})", (site_id, *OPEN)).fetchone()["n"]
+
     def requirements(self, site) -> dict[str, Any]:
         """What a site must match before it trains (pinning), and the current global."""
 
         with contextlib.closing(self._connect()) as db:
             current = self._current(db)
             req = self._meta(db, "requirements", {})
-            fresh = db.execute("SELECT canary_key FROM sites WHERE id=?", (site["id"],)).fetchone()
             return {
                 "version": current["version"] if current else None,
                 "sha256": current["sha256"] if current else None,
                 "size": current["size"] if current else None, "dtype": current["dtype"] if current else None,
                 "trainer": req.get("trainer"), "config_sha256": req.get("config_sha256"),
                 "client_min": req.get("client_min"), "validator_version": self._meta(db, "validator_version"),
-                "canary_required": fresh["canary_key"] != self._canary_key(db),
+                "canary_required": self._canary_required(db, site["id"]),
+                "max_canary_steps": self.config.max_canary_steps,
+                "open_deltas": self._open_deltas(db, site["id"]), "max_open_deltas": self.config.max_open_deltas,
+                "publish_key": self._meta(db, "publish_key"),
                 "training": self._meta(db, "training", {}), "norm_bounds": self._meta(db, "norm_bounds"),
                 "heartbeat_s": self.config.heartbeat_s, "terms_sha256": terms.TERMS_SHA256,
                 "attestation_sha256": terms.ATTESTATION_SHA256,
@@ -339,7 +420,8 @@ class Service:
         if row is None or row["deleted"]:
             raise ApiError(404, "no_version", "no such retained global version")
         return {"version": row["version"], "sha256": row["sha256"], "size": row["size"], "dtype": row["dtype"],
-                "url": self.storage.download_url(row["object_key"], self.config.url_expiry_s)}
+                "signature": row["signature"], "url": self.storage.download_url(row["object_key"],
+                                                                                 self.config.url_expiry_s)}
 
     def _expire_leases(self, db) -> None:
         for row in db.execute("SELECT id, lease_site FROM shards WHERE state='leased' AND lease_expires < ?",
@@ -379,8 +461,9 @@ class Service:
                 db.execute("UPDATE shards SET lease_expires=? WHERE id=? AND state='leased' AND lease_site=?",
                            (now + self.config.lease_s, beat["shard_id"], site["id"]))
             db.execute("UPDATE sites SET last_seen=?, heartbeat=? WHERE id=?", (now, json.dumps(beat), site["id"]))
-            db.execute("INSERT INTO heartbeats (site_id, ts, tokens, gpus) VALUES (?, ?, ?, ?)",
-                       (site["id"], now, beat.get("tokens", 0.0), beat.get("gpus", 0)))
+            if self.disk_ok():   # history is optional; never fill the volume with it
+                db.execute("INSERT INTO heartbeats (site_id, ts, tokens, gpus) VALUES (?, ?, ?, ?)",
+                           (site["id"], now, beat.get("tokens", 0.0), beat.get("gpus", 0)))
             db.execute("DELETE FROM heartbeats WHERE ts < ?", (now - 8 * 86400,))
         return {"ok": True, "next_s": self.config.heartbeat_s}
 
@@ -403,18 +486,11 @@ class Service:
             raise ApiError(400, "bad_request", "mode recipe needs shard_id; mode byo takes an optional tag "
                                                "(1-64 of letters, digits, . : + - _)")
         meta = _typed(body.get("meta", {}), DELTA_META, "meta")
-        with self.tx() as db:
-            existing = db.execute("SELECT * FROM deltas WHERE site_id=? AND client_id=?",
-                                  (site["id"], client_id)).fetchone()
-            if existing is not None:   # idempotent retry / resume
-                if (existing["sha256"], existing["size"]) != (sha, size):
-                    raise ApiError(409, "client_id_reused", "this client_id was used for a different file")
-                return self._delta_reply(db, existing, resume=True)
-            same = db.execute("SELECT * FROM deltas WHERE sha256=? AND state != 'uploading'", (sha,)).fetchone()
-            if same is not None:
-                if same["site_id"] != site["id"]:
-                    raise ApiError(409, "duplicate", "this exact delta was already uploaded by another site")
-                return self._delta_reply(db, same, duplicate=True)
+        self._require_disk()
+        with self.tx() as db:   # every check; no network call while the write lock is held
+            reply = self._existing_reply(db, site, client_id, sha, size)
+            if reply is not None:
+                return reply
             req = self._meta(db, "requirements", {})   # what makes a delta mergeable at all (the validator version
             wanted = {"trainer": req.get("trainer"), "config_sha256": req.get("config_sha256")}   # is not: it re-checks)
             got = {k: meta.get(k) for k in wanted}
@@ -433,28 +509,67 @@ class Service:
                 shard = db.execute("SELECT holders FROM shards WHERE id=?", (shard_id,)).fetchone()
                 if shard is None or site["public_id"] not in json.loads(shard["holders"]):
                     raise ApiError(409, "shard_not_leased", "this site never leased that shard")
+            canary = self._canary_required(db, site["id"])   # decided here, never by the client
+            if canary:
+                if int(meta.get("steps") or 10**9) > self.config.max_canary_steps:
+                    raise ApiError(409, "canary_required", f"this site must first pass a canary of at most "
+                                                           f"{self.config.max_canary_steps} steps; run `drafter-join run`")
+                if db.execute("SELECT 1 FROM deltas WHERE site_id=? AND canary=1 AND state IN "
+                              "('uploading', 'pending', 'validating')", (site["id"],)).fetchone():
+                    raise ApiError(409, "canary_pending", "this site's canary is still being validated")
+            elif self._open_deltas(db, site["id"]) >= self.config.max_open_deltas:
+                raise ApiError(429, "too_many_pending", f"this site already has {self.config.max_open_deltas} "
+                                                        "unmerged deltas; wait for the next merge")
+            if db.execute("SELECT COUNT(*) AS n FROM deltas WHERE site_id=? AND state='uploading'",
+                          (site["id"],)).fetchone()["n"] >= self.config.max_open_uploads:
+                raise ApiError(429, "too_many_uploads", "finish or abandon this site's open uploads first")
             delta = {"client_id": client_id, "sha256": sha, "base_sha256": base_sha, "mode": mode,
                      "shard_id": shard_id, "tag": tag}
             if not terms.verify_attestation(site["token_hash"], delta, body.get("attestation")):
                 raise ApiError(400, "attestation_invalid", "missing or invalid data-source attestation")
-            delta_id = "d_" + secrets.token_hex(8)
-            key = f"deltas/{site['public_id']}/{delta_id}.safetensors"
-            plan = self.storage.plan_upload(key, size, self.config.url_expiry_s)
-            upload_id = "u_" + secrets.token_hex(8)
-            db.execute("INSERT INTO uploads (id, kind, ref, object_key, size, sha256, backend, created) VALUES "
-                       "(?, 'delta', ?, ?, ?, ?, ?, ?)",
-                       (upload_id, delta_id, key, size, sha, json.dumps(plan.pop("backend")), self.now()))
-            db.execute(
-                "INSERT INTO deltas (id, client_id, site_id, base_version, base_sha256, mode, shard_id, tag, canary, "
-                "meta, attestation, object_key, size, sha256, upload_id, state, created, updated) VALUES "
-                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'uploading', ?, ?)",
-                (delta_id, client_id, site["id"], base_version, base_sha, mode, shard_id, tag,
-                 int(bool(body.get("canary"))), json.dumps(meta), json.dumps(body.get("attestation")), key, size, sha,
-                 upload_id, self.now(), self.now()))
-            row = db.execute("SELECT * FROM deltas WHERE id=?", (delta_id,)).fetchone()
-            reply = self._delta_reply(db, row)
-            reply["upload"] = plan
-            return reply
+        delta_id = "d_" + secrets.token_hex(8)
+        key = f"deltas/{site['public_id']}/{delta_id}.safetensors"
+        plan = self.storage.plan_upload(key, size, self.config.url_expiry_s)
+        backend = plan.pop("backend")
+        upload_id = "u_" + secrets.token_hex(8)
+        try:
+            with self.tx() as db:
+                reply = self._existing_reply(db, site, client_id, sha, size)   # a concurrent retry won the race
+                if reply is not None:
+                    raise _Raced(reply)
+                db.execute("INSERT INTO uploads (id, kind, ref, object_key, size, sha256, backend, created) VALUES "
+                           "(?, 'delta', ?, ?, ?, ?, ?, ?)",
+                           (upload_id, delta_id, key, size, sha, json.dumps(backend), self.now()))
+                db.execute(
+                    "INSERT INTO deltas (id, client_id, site_id, base_version, base_sha256, mode, shard_id, tag, "
+                    "canary, meta, attestation, object_key, size, sha256, upload_id, state, created, updated) VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'uploading', ?, ?)",
+                    (delta_id, client_id, site["id"], base_version, base_sha, mode, shard_id, tag, int(canary),
+                     json.dumps(meta), json.dumps(body.get("attestation")), key, size, sha, upload_id, self.now(),
+                     self.now()))
+                row = db.execute("SELECT * FROM deltas WHERE id=?", (delta_id,)).fetchone()
+                reply = self._delta_reply(db, row)
+        except (_Raced, sqlite3.IntegrityError) as raced:
+            self.storage.abort_upload(key, backend)
+            if isinstance(raced, _Raced):
+                return raced.reply
+            raise ApiError(409, "conflict", "a concurrent request registered this delta; retry") from raced
+        reply["upload"] = plan
+        return reply
+
+    def _existing_reply(self, db, site, client_id: str, sha: str, size: int) -> dict[str, Any] | None:
+        existing = db.execute("SELECT * FROM deltas WHERE site_id=? AND client_id=?", (site["id"], client_id)).fetchone()
+        if existing is not None:   # idempotent retry / resume
+            if (existing["sha256"], existing["size"]) != (sha, size):
+                raise ApiError(409, "client_id_reused", "this client_id was used for a different file")
+            return self._delta_reply(db, existing, resume=True)
+        same = db.execute("SELECT * FROM deltas WHERE sha256=? AND state NOT IN ('uploading', 'abandoned')",
+                          (sha,)).fetchone()
+        if same is not None:
+            if same["site_id"] != site["id"]:
+                raise ApiError(409, "duplicate", "this exact delta was already uploaded by another site")
+            return self._delta_reply(db, same, duplicate=True)
+        return None
 
     def _delta_reply(self, db, row, resume: bool = False, duplicate: bool = False) -> dict[str, Any]:
         reply = {"delta_id": row["id"], "state": row["state"], "duplicate": duplicate, "upload_id": row["upload_id"]}
@@ -467,7 +582,8 @@ class Service:
 
     def refresh_upload(self, owner, upload_id: str, numbers: list[int]) -> dict[str, Any]:
         with contextlib.closing(self._connect()) as db:
-            upload = db.execute("SELECT * FROM uploads WHERE id=? AND completed IS NULL", (upload_id,)).fetchone()
+            upload = db.execute("SELECT * FROM uploads WHERE id=? AND completed IS NULL AND aborted IS NULL",
+                                (upload_id,)).fetchone()
             if upload is None or not self._owns(db, owner, upload):
                 raise ApiError(404, "not_found", "no such open upload")
         return self.storage.refresh_upload(upload["object_key"], upload["size"], json.loads(upload["backend"]),
@@ -504,8 +620,11 @@ class Service:
             row = db.execute("SELECT * FROM deltas WHERE id=? AND site_id=?", (delta_id, site["id"])).fetchone()
         if row is None:
             raise ApiError(404, "not_found", "no such delta")
-        return {"delta_id": row["id"], "state": row["state"], "reason_code": row["reason_code"],
-                "reason": row["reason"], "verdict": json.loads(row["verdict"] or "null"), "weight": row["weight"],
+        decision = json.loads(row["verdict"] or "{}").get("decision")
+        final = row["state"] in ("accepted", "held", "quarantined", "merged")
+        return {"delta_id": row["id"], "state": row["state"], "decision": decision,
+                "reason_code": row["reason_code"] if final else None,
+                "reason": REASONS.get(row["reason_code"], "see the reason code") if final else None,
                 "merged_into": row["merged_into"], "canary": bool(row["canary"]), "base_version": row["base_version"]}
 
     def me(self, site) -> dict[str, Any]:
@@ -526,7 +645,9 @@ class Service:
                 self._set_meta(db, "validator_version", version)
                 requeued = db.execute(
                     "UPDATE deltas SET state='pending', claimed=NULL, updated=? WHERE state IN ('quarantined', 'held') "
-                    "AND (validator_version IS NULL OR validator_version != ?)", (self.now(), version)).rowcount
+                    "AND (validator_version IS NULL OR validator_version != ?) AND purged IS NULL "
+                    "AND (reason_code IS NULL OR reason_code != 'site_revoked') "
+                    "AND site_id IN (SELECT id FROM sites WHERE revoked IS NULL)", (self.now(), version)).rowcount
                 self._audit(db, "validator.version", self._actor(validator), str(version), previous=previous,
                             requeued=requeued)
         with contextlib.closing(self._connect()) as db:
@@ -549,7 +670,8 @@ class Service:
             db.execute("UPDATE deltas SET state='pending', claimed=NULL WHERE state='validating' AND claimed < ?",
                        (self.now() - self.config.claim_timeout_s,))
             rows = db.execute("SELECT d.*, s.public_id FROM deltas d JOIN sites s ON s.id=d.site_id "
-                              "WHERE d.state='pending' ORDER BY d.canary DESC, d.received LIMIT ?", (limit,)).fetchall()
+                              "WHERE d.state='pending' AND s.revoked IS NULL ORDER BY d.canary DESC, d.received "
+                              "LIMIT ?", (limit,)).fetchall()
         return [self._delta_for_validator(r) for r in rows]
 
     @staticmethod
@@ -561,7 +683,8 @@ class Service:
 
     def claim_delta(self, validator, delta_id: str) -> dict[str, Any]:
         with self.tx() as db:
-            if not db.execute("UPDATE deltas SET state='validating', claimed=?, updated=? WHERE id=? AND state='pending'",
+            if not db.execute("UPDATE deltas SET state='validating', claimed=?, updated=? WHERE id=? AND state='pending' "
+                              "AND site_id IN (SELECT id FROM sites WHERE revoked IS NULL)",
                               (self.now(), self.now(), delta_id)).rowcount:
                 raise ApiError(409, "not_pending", "delta is not pending")
             row = db.execute("SELECT d.*, s.public_id FROM deltas d JOIN sites s ON s.id=d.site_id WHERE d.id=?",
@@ -581,7 +704,8 @@ class Service:
         version = str(body.get("validator_version", ""))
         with self.tx() as db:
             row = db.execute("SELECT * FROM deltas WHERE id=?", (delta_id,)).fetchone()
-            if row is None or row["state"] not in ("validating", "pending"):
+            late = row is not None and row["state"] == "accepted" and decision in ("hold", "reject")   # merge-time
+            if row is None or not (row["state"] in ("validating", "pending") or late):
                 raise ApiError(409, "not_validating", "delta is not being validated")
             verdict = {k: body.get(k) for k in ("decision", "metrics", "base_metrics", "checks", "weight_factor",
                                                  "staleness", "message")}
@@ -600,7 +724,7 @@ class Service:
 
         with contextlib.closing(self._connect()) as db:
             rows = db.execute("SELECT d.*, s.public_id FROM deltas d JOIN sites s ON s.id=d.site_id "
-                              "WHERE d.state='accepted' AND d.merged_into IS NULL" +
+                              "WHERE d.state='accepted' AND d.merged_into IS NULL AND s.revoked IS NULL" +
                               ("" if self.config.merge_canaries else " AND d.canary=0") +
                               " ORDER BY d.received").fetchall()
         return [self._delta_for_validator(r) | {"verdict": json.loads(r["verdict"] or "{}"),
@@ -611,13 +735,14 @@ class Service:
             raise ApiError(400, "bad_request", "sha256 (hex), size (int) and dtype fp32|bf16 required")
         if not 0 < size <= self.config.max_weights_bytes:
             raise ApiError(413, "too_large", "weights too large")
-        with self.tx() as db:
+        with contextlib.closing(self._connect()) as db:
             current = self._current(db)
-            if version != (current["version"] + 1 if current else 0):
-                raise ApiError(409, "version_order", "versions are published in order")
-            key = f"globals/v{version:06d}-{sha256[:12]}.safetensors"
-            plan = self.storage.plan_upload(key, size, self.config.url_expiry_s)
-            upload_id = "u_" + secrets.token_hex(8)
+        if version != (current["version"] + 1 if current else 0):
+            raise ApiError(409, "version_order", "versions are published in order")
+        key = f"globals/v{version:06d}-{sha256[:12]}.safetensors"
+        plan = self.storage.plan_upload(key, size, self.config.url_expiry_s)
+        upload_id = "u_" + secrets.token_hex(8)
+        with self.tx() as db:
             db.execute("INSERT INTO uploads (id, kind, ref, object_key, size, sha256, backend, created) VALUES "
                        "(?, 'version', ?, ?, ?, ?, ?, ?)",
                        (upload_id, str(version), key, size, sha256, json.dumps(plan.pop("backend")), self.now()))
@@ -641,11 +766,14 @@ class Service:
             if current is not None and current["version"] >= version:
                 return {"version": current["version"], "already": True}
             db.execute("UPDATE uploads SET completed=? WHERE id=?", (self.now(), upload["id"]))
+            signature = body.get("signature")
+            if signature is not None and not re.fullmatch(r"[0-9a-f]{128}", str(signature)):
+                raise ApiError(400, "bad_request", "signature must be 64 bytes of hex (ed25519)")
             db.execute("INSERT INTO versions (version, object_key, sha256, size, dtype, created, evals, merged, "
-                       "heldout_id, validator_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                       "heldout_id, validator_version, signature) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                        (version, upload["object_key"], upload["sha256"], upload["size"], body.get("dtype", "bf16"),
                         self.now(), json.dumps(body.get("evals") or {}), json.dumps(merged),
-                        str(body.get("heldout_id") or "")[:80], self._meta(db, "validator_version")))
+                        str(body.get("heldout_id") or "")[:80], self._meta(db, "validator_version"), signature))
             for item in merged:
                 db.execute("UPDATE deltas SET state='merged', merged_into=?, weight=?, updated=? WHERE id=? AND "
                            "state='accepted'", (version, float(item.get("weight", 0)), self.now(), item["delta_id"]))
@@ -667,7 +795,7 @@ class Service:
                               ).fetchall()
             keep = {r["version"] for r in rows[: self.config.keep_globals]}
             keep |= {r["base_version"] for r in db.execute(
-                "SELECT DISTINCT base_version FROM deltas WHERE state != 'merged'")}
+                "SELECT DISTINCT base_version FROM deltas WHERE state != 'merged' AND purged IS NULL")}
             for site in db.execute("SELECT heartbeat FROM sites WHERE last_seen > ?",
                                    (self.now() - self.config.pin_heartbeat_s,)):
                 version = json.loads(site["heartbeat"] or "{}").get("version")
@@ -679,6 +807,33 @@ class Service:
         for row in retired:
             self.storage.delete(row["object_key"])
         return [r["version"] for r in retired]
+
+    def maintenance(self) -> dict[str, int]:
+        """Abort abandoned uploads (S3 multipart, local parts; GCS sessions just lapse), delete delta objects after
+        their retention, and retire unused globals.  The serve loop runs it every few minutes."""
+
+        now, aborted, purged = self.now(), [], []
+        with self.tx() as db:
+            for row in db.execute("SELECT * FROM uploads WHERE completed IS NULL AND aborted IS NULL AND created < ?",
+                                  (now - self.config.upload_ttl_s,)).fetchall():
+                db.execute("UPDATE uploads SET aborted=? WHERE id=?", (now, row["id"]))
+                if row["kind"] == "delta":
+                    db.execute("UPDATE deltas SET state='abandoned', updated=? WHERE id=? AND state='uploading'",
+                               (now, row["ref"]))
+                aborted.append(row)
+            for row in db.execute(
+                    "SELECT id, object_key FROM deltas WHERE purged IS NULL AND ((state='merged' AND updated < ?) OR "
+                    "(state='quarantined' AND updated < ?))",
+                    (now - self.config.delta_retention_s, now - self.config.quarantine_retention_s)).fetchall():
+                db.execute("UPDATE deltas SET purged=? WHERE id=?", (now, row["id"]))
+                purged.append(row)
+            if aborted or purged:
+                self._audit(db, "maintenance", "coordinator", "", aborted=len(aborted), purged=len(purged))
+        for row in aborted:
+            self.storage.abort_upload(row["object_key"], json.loads(row["backend"]))
+        for row in purged:
+            self.storage.delete(row["object_key"])
+        return {"aborted": len(aborted), "purged": len(purged), "retired": len(self.collect_versions())}
 
     # ------------------------------------------------------------------ public
     def _site_stats(self, db) -> dict[int, dict[str, Any]]:
@@ -728,15 +883,18 @@ class Service:
                     gpu_hours += (row["gpus"] or 0) * min(row["ts"] - last[row["site_id"]],
                                                           3 * self.config.heartbeat_s) / 3600
                 last[row["site_id"]] = row["ts"]
+            # coarse and delayed: per group (no categories), 2 decimals, published versions older than curve_delay_s
             curve = [{"version": r["version"], "created": r["created"], "heldout_id": r["heldout_id"],
-                      "metrics": json.loads(r["evals"] or "{}").get("metrics", {}),
+                      "metrics": {k: round(float(v), 2) for k, v in
+                                  json.loads(r["evals"] or "{}").get("metrics", {}).items() if "." not in k},
                       "merged": len(json.loads(r["merged"] or "[]"))}
-                     for r in db.execute("SELECT * FROM versions ORDER BY version")]
+                     for r in db.execute("SELECT * FROM versions WHERE created <= ? ORDER BY version",
+                                         (now - self.config.curve_delay_s,))]
             reasons = {r["reason_code"] or "unspecified": r["n"] for r in db.execute(
                 "SELECT reason_code, COUNT(*) AS n FROM deltas WHERE state IN ('quarantined', 'held') "
                 "GROUP BY reason_code")}
             latest = curve[-1]["metrics"] if curve else {}
-            weakest = sorted(((v, k) for k, v in latest.items() if "." in k), key=lambda x: x[0])[:3]
+            weakest = sorted(((v, k) for k, v in latest.items()), key=lambda x: x[0])[:3]
             return {
                 "generated": now,
                 "global": {"version": current["version"], "created": current["created"],
@@ -752,6 +910,12 @@ class Service:
                 "rejections": reasons, "benchmarks": self._meta(db, "benchmarks"),
                 "terms": {"version": terms.TERMS_VERSION, "sha256": terms.TERMS_SHA256},
             }
+
+
+class _Raced(Exception):
+    def __init__(self, reply: dict[str, Any]):
+        super().__init__("raced")
+        self.reply = reply
 
 
 def digest(data: bytes) -> str:

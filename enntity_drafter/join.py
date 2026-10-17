@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import shlex
 import shutil
 import subprocess
@@ -44,6 +45,7 @@ from coordinator import terms  # noqa: E402
 from coordinator.client import ApiClient, ApiError, download, sha256_file, upload_file  # noqa: E402
 
 CLIENT_VERSION = "0.1.0"
+SHARD_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")   # coordinator-supplied ids become directory names
 HOME = Path(os.environ.get("DRAFTER_HOME", Path.home() / ".enntity-drafter"))
 #: Published training settings a site accepts, with their types (nothing else from the network reaches argv).
 TRAINING_KEYS = {"lr": float, "warmup": int, "min_lr_ratio": float, "anchors": int, "weight_decay": float,
@@ -110,7 +112,7 @@ def redeem(link: str, name: str | None, accept: bool, home: Path = HOME,
     reply = api.call("POST", "/api/v1/redeem", {"code": code, "display_name": name, "accept_terms": info["sha256"]},
                      auth=False)
     path = save_config({"coordinator": base, "token": reply["token"], "public_id": reply["public_id"],
-                        "display_name": name}, home)
+                        "display_name": name, "publish_key": info.get("publish_key")}, home)
     say(f"registered as {name or 'anonymous'}; token saved to {path} (mode 0600)")
     return reply
 
@@ -209,10 +211,12 @@ def pipeline_store(recipe: dict[str, Any], out: Path, opts: argparse.Namespace, 
 
 class Site:
     def __init__(self, api: ApiClient, token: str, work: Path, opts: argparse.Namespace,
-                 sleep: Callable[[float], None] = time.sleep):
+                 sleep: Callable[[float], None] = time.sleep, config: dict[str, Any] | None = None,
+                 home: Path | None = None):
         from . import model as sm
 
-        self.api, self.token, self.work, self.opts, self.sleep = api, token, Path(work), opts, sleep
+        self.api, self.token, self.work, self.opts, self.sleep = api, token, Path(work).resolve(), opts, sleep
+        self.config, self.home = dict(config or {}), home
         self.cfg = sm.load_config(opts.config)
         self.work.mkdir(parents=True, exist_ok=True)
         self.state_path = self.work / "state.json"
@@ -283,7 +287,7 @@ class Site:
             return ["--capture-index", str(self.opts.byo_capture_index), "--capture-root", str(self.opts.byo_capture_root)]
         shard, recipe = cycle["shard"], dict(cycle["shard"]["recipe"])
         synthetic = recipe["builder"] == "synthetic"
-        out = self.work / "data" / (shard["id"] + ("-canary" if cycle["canary"] else ""))
+        out = self.inside(self.work / "data" / (self.shard_id(shard) + ("-canary" if cycle["canary"] else "")))
         if cycle["canary"] and not synthetic:   # the canary trains on a small slice of the shard
             recipe["rows"] = [recipe["rows"][0], min(recipe["rows"][1], recipe["rows"][0] + CANARY_ROWS)]
         cycle["data_dir"] = str(out)
@@ -310,7 +314,7 @@ class Site:
                 "--diloco-transport", "external", "--start-weights", cycle["base"]["path"], "--inner-steps", str(inner),
                 "--steps", str(steps), "--eval-every", "0", "--checkpoint-every", str(max(1, inner // 5)),
                 "--keep-checkpoints", "2", "--delta-out", str(delta),
-                "--delta-dtype", str(training.get("delta_dtype", "bf16")), "--seed", str(seed),
+                "--delta-dtype", str(training.get("delta_dtype", "int8")), "--seed", str(seed),
                 "--delta-meta", json.dumps({"client_id": cycle["client_id"], "canary": canary}), "--log-every", "10"]
         for key, kind in TRAINING_KEYS.items():
             if key in training:
@@ -399,6 +403,9 @@ class Site:
         self._drain_outbox()
         cycle = self.state.get("cycle")
         if cycle is None:
+            if not req["canary_required"] and req.get("open_deltas", 0) >= req.get("max_open_deltas", 10**9):
+                raise JoinError("waiting: this site's earlier deltas are not merged yet (the coordinator limits "
+                                "unmerged deltas per site)")
             cycle = {"client_id": uuid.uuid4().hex, "canary": bool(req["canary_required"]), "stage": "data"}
             key = f"{req['trainer']}|{req['config_sha256']}"
             if self.state.get("trainer_key") not in (None, key):   # pins changed: the old optimizer state is void
@@ -421,7 +428,8 @@ class Site:
         if cycle["stage"] == "base":
             self.set_phase("pulling")
             info = self.api.call("GET", "/api/v1/global")
-            path = self.work / "globals" / f"v{info['version']:06d}.safetensors"
+            self.verify_global(req, info)
+            path = self.work / "globals" / f"v{int(info['version']):06d}.safetensors"
             if not path.is_file() or sha256_file(path) != info["sha256"]:
                 download(info["url"], path, sha256=info["sha256"], size=info["size"])
             cycle["base"] = {"version": info["version"], "sha256": info["sha256"], "path": str(path)}
@@ -460,6 +468,11 @@ class Site:
                     raise
                 raise self._set_aside(cycle, "unmergeable", f"the network changed during this round ({error.code}: "
                                                             f"{error.message})") from error
+            if reply["state"] == "abandoned":   # an upload left for more than a day: register it again
+                cycle["client_id"] = uuid.uuid4().hex
+                cycle.pop("transfer", None)
+                self.save()
+                return self.cycle()
             cycle["delta_id"] = reply["delta_id"]
             self.save()
             if reply["state"] == "uploading":
@@ -483,8 +496,8 @@ class Site:
             self.save()
         self.set_phase("cleaning")
         self.state["outbox"].append({"delta_id": cycle["delta_id"], "path": cycle["delta"]})
-        if cycle.get("data_dir"):
-            shutil.rmtree(cycle["data_dir"], ignore_errors=True)   # activations (never bring-your-own data)
+        if cycle.get("data_dir"):   # activations (never bring-your-own data, never outside the work directory)
+            shutil.rmtree(self.inside(Path(cycle["data_dir"])), ignore_errors=True)
         if cycle["canary"]:
             shutil.rmtree(self.work / ("canary-" + cycle["client_id"]), ignore_errors=True)
         else:
@@ -495,10 +508,47 @@ class Site:
         self.set_phase("idle")
         return {"delta_id": cycle["delta_id"], "canary": cycle["canary"], "base_version": cycle["base"]["version"]}
 
+    @staticmethod
+    def shard_id(shard: dict[str, Any]) -> str:
+        if not isinstance(shard.get("id"), str) or not SHARD_ID.match(shard["id"]):
+            raise JoinError("the coordinator sent an invalid shard id; refusing to use it")
+        return shard["id"]
+
+    def inside(self, path: Path) -> Path:
+        """``path`` resolved, and refused unless it lies under ``<work>/data``."""
+
+        resolved, root = Path(path).resolve(), (self.work / "data").resolve()
+        if root not in resolved.parents:
+            raise JoinError(f"refusing to touch {path}: outside {root}")
+        return resolved
+
+    def verify_global(self, req: dict[str, Any], info: dict[str, Any]) -> None:
+        """Check the operator's ed25519 signature on a global (key pinned at registration, or on first sight)."""
+
+        pinned, offered = self.config.get("publish_key"), req.get("publish_key")
+        if pinned is None and offered:
+            pinned = self.config["publish_key"] = offered
+            if self.home is not None:
+                save_config(self.config, self.home)
+        elif pinned and offered and offered != pinned:
+            raise JoinError("the network's publishing key changed since this site registered; confirm the new key "
+                            "with the operator, then update publish_key in your config")
+        if not pinned:
+            return
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+        try:
+            Ed25519PublicKey.from_public_bytes(bytes.fromhex(pinned)).verify(
+                bytes.fromhex(info.get("signature") or ""), terms.global_message(info["version"], info["sha256"]))
+        except (InvalidSignature, ValueError) as error:
+            raise JoinError(f"global v{info['version']} is not signed by the network's publishing key; "
+                            "not training on it") from error
+
     def _set_aside(self, cycle: dict[str, Any], folder: str, why: str) -> JoinError:
         """Keep this cycle's delta under ``<work>/<folder>/`` for inspection and start the next cycle fresh."""
 
-        delta = self.work / "outbox" / f"{cycle['client_id']}.safetensors"
+        delta = Path(cycle.get("delta") or self.work / "outbox" / f"{cycle['client_id']}.safetensors")
         kept = self.work / folder / delta.name
         if delta.is_file():
             kept.parent.mkdir(parents=True, exist_ok=True)
@@ -547,7 +597,7 @@ class Site:
                 try:
                     result = self.cycle()
                 except JoinError as error:
-                    if "no recipe shard" not in str(error):
+                    if "no recipe shard" not in str(error) and not str(error).startswith("waiting"):
                         raise
                     say(str(error))
                     self.sleep(300)
@@ -663,7 +713,8 @@ def smoke(opts: argparse.Namespace) -> tuple[bool, str]:
 
 def site_from(opts: argparse.Namespace) -> Site:
     config = load_config(Path(opts.home))
-    return Site(ApiClient(config["coordinator"], config["token"]), config["token"], Path(opts.work), opts)
+    return Site(ApiClient(config["coordinator"], config["token"]), config["token"], Path(opts.work), opts,
+                config=config, home=Path(opts.home))
 
 
 def build_parser() -> argparse.ArgumentParser:

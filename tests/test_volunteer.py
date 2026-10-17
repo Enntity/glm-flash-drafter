@@ -42,11 +42,13 @@ from enntity_drafter import data as sd  # noqa: E402
 from enntity_drafter import diloco as dl  # noqa: E402
 from enntity_drafter import join  # noqa: E402
 from enntity_drafter import model as sm  # noqa: E402
-from enntity_drafter.guard import SCRATCH_STAMP_KEY, guarded_torch_load, scratch_stamp  # noqa: E402
+from enntity_drafter.guard import SCRATCH_STAMP_KEY, guarded_load_file, guarded_torch_load, scratch_stamp  # noqa: E402
 from enntity_drafter.train import TRAINER_VERSION  # noqa: E402
 from enntity_drafter.validation import Thresholds, evaluate, metrics_of  # noqa: E402
 from test_coordinator import Net, send_delta  # noqa: E402
-from validator.worker import Validator  # noqa: E402
+from coordinator.client import ApiError  # noqa: E402
+from enntity_drafter.validation import judge  # noqa: E402
+from validator.worker import Validator, merge_weights  # noqa: E402
 
 H, ROUNDS = 20, 3
 HPARAMS = ["--lr", "2e-3", "--warmup", "30", "--anchors", "32", "--weight-decay", "0.0"]
@@ -131,7 +133,7 @@ class EndToEndTests(unittest.TestCase):
                                                        "--eval-every", "0"])
         params = guarded_torch_load(root / "init" / "checkpoints" / "step-0000001" / "rank0.pt", "drafter")["params"]
         # 3. the network
-        net = Net(root / "net", part_size=64 * 2**20)
+        net = Net(root / "net", part_size=64 * 2**20, require_canary=True)
         pins = {"trainer": TRAINER_VERSION, "config_sha256": dl.config_sha256(self.cfg)}
         net.admin_call("POST", "/admin/settings/requirements", {"value": pins})
         net.admin_call("POST", "/admin/settings/training", {"value": {
@@ -214,6 +216,7 @@ class EndToEndTests(unittest.TestCase):
         noise = write_delta(root / "noise.safetensors", {k: torch.randn_like(v) * typical * 100 for k, v in
                                                           merged.items()}, current["sha256"], meta)
         mallory = net.register("mallory")
+        net.pass_canary(mallory)
         ids = [send_delta(mallory, path, current["version"], current["sha256"], f"mallory-{i:04d}",
                           meta={"tokens": 500.0, **pins})["delta_id"] for i, path in enumerate((flipped, noise))]
         validator.step()
@@ -241,12 +244,60 @@ class ClientTests(unittest.TestCase):
         with self.assertRaises(join.JoinError):
             join.parse_invite("http://example.org/drafter/join#invite=inv_abc")    # no tokens over plain HTTP
 
+    def test_coordinator_supplied_shard_ids_cannot_escape_the_work_dir(self):   # review 11
+        with tempfile.TemporaryDirectory() as tmp:
+            opts = join.build_parser().parse_args(["run", "--work", tmp, "--config", str(TINY)])
+            site = join.Site(ApiClient("http://127.0.0.1:9", retries=0), "token", Path(tmp) / "w", opts)
+            for bad in ("../../etc", "a/b", "..", "", "x" * 65, None):
+                with self.assertRaises(join.JoinError, msg=repr(bad)):
+                    site.shard_id({"id": bad})
+            with self.assertRaises(join.JoinError):
+                site.inside(Path(tmp) / "w" / "data" / ".." / "..")
+            victim = Path(tmp) / "keep"
+            victim.mkdir()
+            cycle = {"canary": False, "shard": {"id": "../../keep", "recipe": {"builder": "synthetic", "rows": [0, 1]}}}
+            with self.assertRaises(join.JoinError):
+                site._data(cycle)
+            self.assertTrue(victim.is_dir())
+
+    def test_int8_is_the_default_delta_format(self):
+        from enntity_drafter import train
+
+        args = train.parse_args(["--config", str(TINY), "--teacher", "t", "--features", "f", "--output", "o"])
+        self.assertEqual(args.delta_dtype, "int8")
+
+    def test_judge_fails_closed_and_weights_are_capped_per_site(self):   # review 1 and 2
+        thresholds = Thresholds()
+        base = {"heldout": 5.0, "agentic": 4.0, "heldout.prose": 3.0}
+        for candidate in ({"heldout": float("nan"), "agentic": 4.0}, {"heldout": 5.0},
+                          {"heldout": float("inf"), "agentic": 4.0}, {"heldout": "5", "agentic": 4.0}):
+            self.assertEqual(judge(base, candidate, thresholds)[:2], ("reject", "heldout_invalid"), candidate)
+        self.assertEqual(judge(base, {"heldout": 5.0, "agentic": 4.0}, thresholds)[0], "accept")
+
+        def item(site, tokens):
+            return {"site": site, "meta": {"tokens": tokens}, "verdict": {}, "base_version": 5}
+
+        self.assertEqual(merge_weights([item("a", 1e12), item("b", 1000.0)], 5, thresholds), [1.0, 1.0])
+        weights = merge_weights([item("a", 1e12), item("a", 1e12), item("b", 1000.0), item("c", 2000.0),
+                                 item("d", 3000.0)], 5, thresholds)
+        self.assertEqual(weights, [3000.0, 3000.0, 1000.0, 2000.0, 3000.0])   # a: 2 x median site, split
+
 
 # --------------------------------------------------------------------------
 # failure injection on toy weights
 # --------------------------------------------------------------------------
 
 PINS = {"trainer": "scratch-v1", "config_sha256": "c" * 64}
+
+
+def sha256_of(path: Path) -> str:
+    import hashlib
+
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+class Killed(BaseException):
+    pass
 
 
 class Toy:
@@ -258,6 +309,7 @@ class Toy:
         self.start = {k: v + torch.randn(v.shape, generator=generator) for k, v in self.target.items()}
         self.calls = 0
         self.fail_on: set[int] = set()
+        self.kill = False   # True: the failure is the process dying (not catchable by the validator loop)
 
     def distance(self, weights: dict[str, torch.Tensor]) -> float:
         return sum(float((weights[k] - self.target[k]).square().sum()) for k in self.target) ** 0.5
@@ -265,13 +317,19 @@ class Toy:
     def evaluate(self, path: Path) -> dict[str, float]:
         self.calls += 1
         if self.calls in self.fail_on:
+            if self.kill:
+                raise Killed("process killed during evaluation")
             raise RuntimeError("injected crash during evaluation")
         weights, _ = dl.load_weights(path)
         score = 8.0 - 6.0 * self.distance(weights) / self.distance(self.start)
         return {"heldout": score, "heldout.prose": score - 0.5}
 
-    def honest(self, base: dict[str, torch.Tensor], step: float = 0.2) -> dict[str, torch.Tensor]:
-        return {k: -step * (self.target[k] - base[k]) for k in base}   # delta = base - local
+    def honest(self, base: dict[str, torch.Tensor], step: float = 0.2, seed: int = 0) -> dict[str, torch.Tensor]:
+        """delta = base - local, where local moved ``step`` toward the target plus its own noise (sites differ)."""
+
+        generator = torch.Generator().manual_seed(1000 + seed)
+        return {k: -step * (self.target[k] - base[k]) + 0.5 * step * torch.randn(base[k].shape, generator=generator)
+                for k in base}
 
 
 class FailureInjectionTests(unittest.TestCase):
@@ -307,7 +365,7 @@ class FailureInjectionTests(unittest.TestCase):
         base = dl.load_weights(self.validator.published(version))[0]
         self.count += 1
         path = write_delta(self.root / f"delta{self.count}.safetensors",
-                           self.toy.honest(base, 0.15 + 0.01 * self.count), sha, PINS)   # each site's own step
+                           self.toy.honest(base, 0.15 + 0.01 * self.count, self.count), sha, PINS)
         reply = send_delta(site, path, version, sha, f"client-{self.count:04d}",
                            meta={"validator_version": validator_version})
         return reply["delta_id"]
@@ -317,8 +375,8 @@ class FailureInjectionTests(unittest.TestCase):
 
     def test_validator_crash_mid_evaluation_loses_nothing(self):
         first = self.upload(self.sites[0])
-        self.toy.fail_on = {self.toy.calls + 1}   # the next evaluation crashes
-        with self.assertRaisesRegex(RuntimeError, "injected crash"):
+        self.toy.fail_on, self.toy.kill = {self.toy.calls + 1}, True   # the process dies in the next evaluation
+        with self.assertRaises(Killed):
             self.validator.step()
         self.assertEqual(self.sites[0].call("GET", f"/api/v1/deltas/{first}")["state"], "validating")
         self.assertEqual(self.received(self.sites[0])["tokens_received"], 1000.0)   # credited while stuck
@@ -364,11 +422,131 @@ class FailureInjectionTests(unittest.TestCase):
             for row in db.execute("SELECT id, weight, state FROM deltas"):
                 weights[row["id"]] = (row["weight"], row["state"])
         decay = Thresholds().stale_decay
-        self.assertEqual(weights[stale1], (1000.0 * decay, "merged"))
-        self.assertEqual(weights[stale2], (1000.0 * decay ** 2, "merged"))
+        self.assertEqual(weights[stale1], (decay, "merged"))        # 2 sites: equal per site, then decayed
+        self.assertEqual(weights[stale2], (decay ** 2, "merged"))
         self.assertTrue(all(state == "merged" for _, state in weights.values()))
         distances = [self.toy.distance(dl.load_weights(self.validator.published(v))[0]) for v in range(4)]
         self.assertEqual(distances, sorted(distances, reverse=True))   # every merge moved toward the target
+
+    def upload_deltas(self, site: ApiClient, deltas: dict, name: str) -> str:
+        version, sha, _ = self.current()
+        path = write_delta(self.root / f"{name}.safetensors", deltas, sha, PINS)
+        return send_delta(site, path, version, sha, f"client-{name}")["delta_id"]
+
+    def states(self) -> dict[str, tuple]:
+        with self.net.service.tx() as db:
+            return {r["id"]: (r["state"], r["reason_code"]) for r in db.execute("SELECT * FROM deltas")}
+
+    def test_near_duplicate_of_an_accepted_delta_is_quarantined(self):   # review 2
+        _, _, base = self.current()
+        honest = self.toy.honest(base, 0.2, 7)
+        first = self.upload_deltas(self.sites[0], honest, "orig")
+        copy = self.upload_deltas(self.sites[1], {k: v * 1.001 for k, v in honest.items()}, "copy")
+        self.validator.min_deltas = 3
+        self.validator.step()
+        states = self.states()
+        self.assertEqual(states[first], ("accepted", None))
+        self.assertEqual(states[copy], ("quarantined", "near_duplicate"))
+
+    def test_regressing_merge_is_refused_and_its_deltas_held(self):   # review 3
+        self.validator.state["best_metrics"] = {"heldout": 100.0}   # pretend a much better global was published
+        ids = [self.upload(site) for site in self.sites]
+        self.validator.step()
+        self.assertEqual(self.current()[0], 0)
+        self.assertEqual({self.states()[i] for i in ids}, {("held", "merge_regression")})
+        self.assertIsNone(self.validator.state["pending_merge"])
+        self.validator.state["best_metrics"] = dict(self.validator.state["reference_metrics"])
+        for delta in ids:   # the operator reviews and releases them: nothing was discarded
+            self.net.admin_call("POST", f"/admin/deltas/{delta}/release", {"decision": "accept"})
+        self.validator.step()
+        self.assertEqual(self.current()[0], 1)
+        self.assertEqual({self.states()[i][0] for i in ids}, {"merged"})
+
+    def test_crash_between_merge_and_publish_is_deterministic(self):   # review 5
+        self.validator.outer = {"lr": 1.0, "momentum": 0.9, "nesterov": True}
+        ids = [self.upload(site) for site in self.sites]
+        real, failed = self.validator.api.call, []
+
+        def flaky(method, path, body=None, auth=True):
+            if path.endswith("/publish") and not failed:
+                failed.append(path)
+                raise ApiError(503, "unavailable", "injected crash before publish")
+            return real(method, path, body, auth)
+
+        self.validator.api.call = flaky
+        with self.assertRaises(ApiError):
+            self.validator.step()
+        plan = self.validator.state["pending_merge"]
+        self.assertEqual(sorted(i["delta_id"] for i in plan["items"]), sorted(ids))
+        first_master = sha256_of(self.validator.master(1))
+        first_momentum = sha256_of(self.validator.workdir / "versions" / "momentum-v000001.safetensors")
+        inputs = {i["delta_id"]: guarded_load_file(self.validator.workdir / "inbox" / f"{i['delta_id']}.safetensors",
+                                                   "drafter") for i in plan["items"]}   # fp32 deltas
+        late = self.upload(self.sites[0])   # arrives after the crash: not part of the pinned merge
+        self.validator.step()
+        self.assertEqual(self.current()[0], 1)
+        self.assertEqual(sha256_of(self.validator.master(1)), first_master)   # same inputs, same file
+        self.assertEqual(sha256_of(self.validator.workdir / "versions" / "momentum-v000001.safetensors"),
+                         first_momentum)   # momentum applied once
+        self.assertEqual(self.states()[late][0], "accepted")
+        master0, _ = dl.load_weights(self.validator.master(0))
+        master1, _ = dl.load_weights(self.validator.master(1))
+        weights = [i["weight"] for i in plan["items"]]
+        for name in master0:
+            mean = sum(w * inputs[i["delta_id"]][name] for i, w in zip(plan["items"], weights)) / sum(weights)
+            expected = master0[name] - (mean + 0.9 * mean)   # Nesterov, first step from zero momentum
+            self.assertTrue(torch.allclose(master1[name], expected, atol=1e-6), name)
+
+    def test_validator_error_quarantines_one_delta_and_the_loop_continues(self):   # review 12
+        first = self.upload(self.sites[0])
+        second = self.upload(self.sites[1])
+        self.toy.fail_on = {self.toy.calls + 1}   # a bug while evaluating the first delta
+        self.validator.min_deltas = 3
+        self.validator.step()                        # no exception escapes
+        self.assertEqual(self.states()[first], ("quarantined", "validator_error"))
+        self.assertEqual(self.states()[second][0], "accepted")
+        self.assertEqual(self.received(self.sites[0])["tokens_received"], 1000.0)
+        fixed = self.make_validator("2")
+        fixed.min_deltas = 2
+        fixed.step()   # the version bump re-validates it
+        self.assertEqual({self.states()[d][0] for d in (first, second)}, {"merged"})
+
+    def test_object_changed_after_acceptance_is_quarantined_at_merge(self):   # review 10
+        self.validator.min_deltas = 3
+        a, b = self.upload(self.sites[0]), self.upload(self.sites[1])
+        self.validator.step()
+        (self.validator.workdir / "inbox" / f"{a}.safetensors").unlink()
+        with self.net.service.tx() as db:
+            key = db.execute("SELECT object_key FROM deltas WHERE id=?", (a,)).fetchone()["object_key"]
+        stored = self.root / "net" / "objects" / key
+        stored.write_bytes(os.urandom(stored.stat().st_size))   # overwritten after acceptance
+        self.validator.min_deltas = 1
+        self.validator.step()
+        self.assertEqual(self.states()[a], ("quarantined", "hash_mismatch"))
+        self.assertEqual(self.states()[b][0], "merged")
+
+    def test_globals_are_signed_and_sites_verify_the_signature(self):   # review LOW
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+        key, other = Ed25519PrivateKey.generate(), Ed25519PrivateKey.generate()
+        self.validator.signing_key = key
+        public = key.public_key().public_bytes_raw().hex()
+        self.net.admin_call("POST", "/admin/settings/publish_key", {"value": public})
+        for site in self.sites:
+            self.upload(site)
+        self.validator.step()
+        opts = join.build_parser().parse_args(["run", "--work", str(self.root / "w"), "--config", str(TINY)])
+        site = join.Site(self.sites[0], self.sites[0].token, self.root / "w", opts, config={})
+        req, info = site.api.call("GET", "/api/v1/requirements"), site.api.call("GET", "/api/v1/global")
+        self.assertEqual(info["version"], 1)
+        site.verify_global(req, info)   # pins the key and checks v1
+        self.assertEqual(site.config["publish_key"], public)
+        with self.assertRaises(join.JoinError):
+            site.verify_global(req, {**info, "signature": "00" * 64})
+        with self.assertRaises(join.JoinError):
+            site.verify_global(req, {**info, "sha256": "f" * 64})
+        with self.assertRaises(join.JoinError):
+            site.verify_global({**req, "publish_key": other.public_key().public_bytes_raw().hex()}, info)
 
     def test_recipe_spot_check_catches_a_fabricated_delta(self):
         self.net.admin_call("POST", "/admin/shards", {"recipes": [{"builder": "synthetic", "rows": [i, i + 8]}

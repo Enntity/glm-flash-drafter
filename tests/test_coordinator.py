@@ -60,15 +60,17 @@ class Net:
     def __init__(self, root: Path, part_size: int = 1024, **config):
         self.root, self.clock = root, Clock()
         self.storage = LocalStorage(root / "objects", "http://placeholder", b"k" * 32, part_size=part_size)
-        self.config = Config(**config)
+        self.config = Config(**{"require_canary": False, "curve_delay_s": 0.0, **config})
         self.start()
 
     def start(self) -> None:
         self.service = Service(self.root / "db.sqlite3", self.storage, self.config, clock=self.clock)
-        self.public, self.url = serve_in_thread(App(self.service, "/drafter"))
+        self.app = App(self.service, "/drafter")
+        self.public, self.url = serve_in_thread(self.app)
         self.admin, self.admin_url = serve_in_thread(App(self.service, admin=True))
         self.storage.public_url = self.config.public_url = self.url + "/drafter"
         self.base = self.url + "/drafter"
+        self.admin_token = self.service.issue_admin_token()
 
     def stop(self) -> None:
         for server in (self.public, self.admin):
@@ -76,7 +78,14 @@ class Net:
             server.server_close()
 
     def admin_call(self, method: str, path: str, body: dict | None = None):
-        return ApiClient(self.admin_url, retries=0).call(method, path, body, auth=False)
+        return ApiClient(self.admin_url, self.admin_token, retries=0).call(method, path, body)
+
+    def pass_canary(self, api: ApiClient) -> None:
+        """Mark a site as past its canary (tests of later rounds)."""
+
+        with self.service.tx() as db:
+            db.execute("UPDATE sites SET canary_key=? WHERE token_hash=?",
+                       (self.service._canary_key(db), terms.token_hash(api.token)))
 
     def register(self, name: str | None = "site", home: Path | None = None) -> ApiClient:
         invite = self.admin_call("POST", "/admin/invites", {"label": f"for {name}"})
@@ -370,7 +379,8 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(data["totals"]["tokens_per_day"], 30000.0)
         self.assertEqual(data["totals"]["sites_online"], 1)
         self.assertEqual(data["global"]["version"], 0)
-        self.assertEqual(data["wanted"]["weakest"][0]["category"], "template.prose")
+        self.assertEqual(data["wanted"]["weakest"][0]["category"], "heldout")   # groups only, no categories
+        self.assertEqual(data["curve"][0]["metrics"], {"heldout": 2.0})
         self.assertEqual(data["benchmarks"], {"rows": [["code", 4.89, 3.57]]})
         secrets_ = [named.token, anonymous.token, terms.token_hash(named.token), "for Lab one"]
         secrets_ += [s["public_id"] for s in self.net.service.list_sites()]
@@ -397,6 +407,190 @@ class CoordinatorTests(unittest.TestCase):
             "POST", f"/api/v1/uploads/{again['upload_id']}/refresh", {"parts": n}), state)
         self.assertEqual(site.call("POST", f"/api/v1/deltas/{reply['delta_id']}/complete", {"parts": parts})["state"],
                          "pending")
+
+
+class ReviewRegressionTests(unittest.TestCase):
+    """Regression tests for the security review of the first volunteer-training commit."""
+
+    setUp, tearDown = CoordinatorTests.setUp, CoordinatorTests.tearDown
+
+    def new_blob(self) -> Path:
+        self.blob.write_bytes(os.urandom(3500))
+        return self.blob
+
+    def accept(self, delta_id: str) -> None:
+        self.val.call("POST", f"/api/v1/validator/deltas/{delta_id}/claim")
+        self.val.call("POST", f"/api/v1/validator/deltas/{delta_id}/verdict", {
+            "decision": "accept", "validator_version": "1", "metrics": {"heldout": 9.87654}})
+
+    def test_canary_is_decided_and_enforced_by_the_server(self):   # review 8
+        self.net.service.config.require_canary = True
+        site = self.net.register("cara")
+        with self.assertRaises(ApiError) as long_first:
+            site.call("POST", "/api/v1/deltas", delta_body(site, self.new_blob(), 0, self.v0, "canary-0001",
+                                                            meta={"steps": 500}))
+        self.assertEqual(long_first.exception.code, "canary_required")
+        first = send_delta(site, self.new_blob(), 0, self.v0, "canary-0002", canary=False)   # flag ignored
+        self.assertTrue(site.call("GET", f"/api/v1/deltas/{first['delta_id']}")["canary"])
+        with self.assertRaises(ApiError) as second:
+            site.call("POST", "/api/v1/deltas", delta_body(site, self.new_blob(), 0, self.v0, "canary-0003"))
+        self.assertEqual(second.exception.code, "canary_pending")
+        self.accept(first["delta_id"])
+        later = send_delta(site, self.new_blob(), 0, self.v0, "canary-0004", canary=True)   # flag ignored again
+        self.assertFalse(site.call("GET", f"/api/v1/deltas/{later['delta_id']}")["canary"])
+
+    def test_upload_quotas_reaper_retention_and_disk_guard(self):   # review 2 (pending limit) and 4
+        site = self.net.register("quinn")
+        opened = [site.call("POST", "/api/v1/deltas", delta_body(site, self.new_blob(), 0, self.v0, f"open-{i:04d}"))
+                  for i in range(2)]
+        with self.assertRaises(ApiError) as uploads:
+            site.call("POST", "/api/v1/deltas", delta_body(site, self.new_blob(), 0, self.v0, "open-0002"))
+        self.assertEqual((uploads.exception.status, uploads.exception.code), (429, "too_many_uploads"))
+        self.net.clock.t += self.net.config.upload_ttl_s + 1
+        self.assertEqual(self.net.service.maintenance()["aborted"], 2)
+        self.assertEqual(list((self.root / "objects" / ".uploads").iterdir()), [])
+        self.assertEqual(site.call("GET", f"/api/v1/deltas/{opened[0]['delta_id']}")["state"], "abandoned")
+        with self.assertRaises(ApiError):
+            site.call("POST", f"/api/v1/uploads/{opened[0]['upload_id']}/refresh", {"parts": [1]})
+        self.net.service.config.max_open_deltas = 1
+        done = send_delta(site, self.new_blob(), 0, self.v0, "open-0003")
+        with self.assertRaises(ApiError) as pending:
+            site.call("POST", "/api/v1/deltas", delta_body(site, self.new_blob(), 0, self.v0, "open-0004"))
+        self.assertEqual(pending.exception.code, "too_many_pending")
+        self.accept(done["delta_id"])
+        data = os.urandom(3100)
+        (self.root / "g1.bin").write_bytes(data)
+        reply = self.val.call("POST", "/api/v1/validator/versions/1/upload",
+                              {"size": len(data), "sha256": hashlib.sha256(data).hexdigest(), "dtype": "bf16"})
+        self.val.call("POST", "/api/v1/validator/versions/1/publish", {
+            "upload_id": reply["upload_id"], "parts": upload_file(self.root / "g1.bin", reply["upload"], None, {}),
+            "merged": [{"delta_id": done["delta_id"], "weight": 1.0}]})
+        key = f"deltas/{site.call('GET', '/api/v1/me')['public_id']}/{done['delta_id']}.safetensors"
+        self.assertIsNotNone(self.net.storage.head(key))
+        self.net.clock.t += self.net.config.delta_retention_s + 1
+        self.assertEqual(self.net.service.maintenance()["purged"], 1)
+        self.assertIsNone(self.net.storage.head(key))
+        self.assertEqual(site.call("GET", "/api/v1/me")["deltas_accepted"], 1)   # credit survives the purge
+        self.net.service.config.min_free_bytes = 2**62
+        with self.assertRaises(ApiError) as low:
+            site.call("POST", "/api/v1/deltas", delta_body(site, self.new_blob(), 1, "0" * 64, "open-0005"))
+        self.assertEqual((low.exception.status, low.exception.code), (503, "low_disk"))
+        self.assertTrue(site.call("POST", "/api/v1/heartbeat", {"phase": "idle"})["ok"])   # still answered
+        self.net.storage.min_free_bytes = 2**62
+        status, _, _ = self.net.storage.handle_blob("PUT", "x.y", None, 10)
+        self.assertEqual(status, 403)
+        upload = self.net.storage.plan_upload("deltas/x/y.safetensors", 10, 60)
+        token = upload["parts"][0]["url"].rsplit("/blob/", 1)[1]
+        self.assertEqual(self.net.storage.handle_blob("PUT", token, None, 10)[0], 507)
+
+    def test_revoked_site_work_is_quarantined_and_never_merged(self):   # review 7
+        site = self.net.register("rex")
+        pending = send_delta(site, self.new_blob(), 0, self.v0, "revoke-0001")
+        accepted = send_delta(site, self.new_blob(), 0, self.v0, "revoke-0002")
+        self.accept(accepted["delta_id"])
+        public_id = site.call("GET", "/api/v1/me")["public_id"]
+        self.net.admin_call("POST", f"/admin/sites/{public_id}/revoke")
+        self.assertEqual(self.val.call("GET", "/api/v1/validator/pending"), [])
+        self.assertEqual(self.val.call("GET", "/api/v1/validator/mergeable"), [])
+        self.val.call("POST", "/api/v1/validator/hello", {"version": "2"})   # a version bump does not revive them
+        self.assertEqual(self.val.call("GET", "/api/v1/validator/pending"), [])
+        with self.net.service.tx() as db:
+            states = {r["id"]: (r["state"], r["reason_code"]) for r in db.execute("SELECT * FROM deltas")}
+        for delta in (pending, accepted):
+            self.assertEqual(states[delta["delta_id"]], ("quarantined", "site_revoked"))
+
+    def test_sites_see_codes_not_scores_and_the_curve_is_coarse_and_delayed(self):   # review 9
+        site = self.net.register("orla")
+        delta = send_delta(site, self.new_blob(), 0, self.v0, "oracle-0001")
+        self.accept(delta["delta_id"])
+        status = site.call("GET", f"/api/v1/deltas/{delta['delta_id']}")
+        text = json.dumps(site.call("GET", "/api/v1/me"))
+        self.assertNotIn("verdict", status)
+        self.assertNotIn("9.87", text)
+        self.assertEqual((status["decision"], status["reason"]), ("accept", "accepted"))
+        self.net.service.config.curve_delay_s = 3600
+        self.net.publish(self.val, 1, os.urandom(2001))
+        curve = self.net.service.dashboard()["curve"]
+        self.assertEqual([p["version"] for p in curve], [])   # nothing younger than an hour
+        self.net.clock.t += 3601
+        curve = self.net.service.dashboard()["curve"]
+        self.assertEqual([p["version"] for p in curve], [0, 1])
+        self.assertTrue(all("." not in k and round(v, 2) == v for p in curve for k, v in p["metrics"].items()))
+
+    def test_unread_request_body_closes_the_connection(self):   # review 6
+        import socket
+
+        host, port = self.net.url.split("//")[1].split(":")
+        smuggled = b"GET /drafter/api/v1/terms HTTP/1.1\r\nHost: x\r\n\r\n"
+        request = (b"POST /drafter/api/v1/heartbeat HTTP/1.1\r\nHost: x\r\nContent-Length: "
+                   + str(len(smuggled)).encode() + b"\r\n\r\n" + smuggled)
+        with socket.create_connection((host, int(port)), timeout=5) as conn:
+            conn.sendall(request)
+            received = b""
+            while chunk := conn.recv(65536):
+                received += chunk
+        self.assertIn(b"401", received.split(b"\r\n", 1)[0])
+        self.assertIn(b"Connection: close", received)
+        self.assertEqual(received.count(b"HTTP/1.1 "), 1)   # the body was never served as a second request
+
+    def test_plan_upload_runs_outside_the_write_lock(self):   # review LOW
+        import sqlite3
+
+        original, seen = self.net.storage.plan_upload, []
+
+        def probe(*args, **kwargs):
+            db = sqlite3.connect(self.root / "db.sqlite3", timeout=0.2, isolation_level=None)
+            db.execute("BEGIN IMMEDIATE")   # raises "database is locked" if the coordinator still holds it
+            db.execute("ROLLBACK")
+            db.close()
+            seen.append(True)
+            return original(*args, **kwargs)
+
+        self.net.storage.plan_upload = probe
+        site = self.net.register("lock")
+        site.call("POST", "/api/v1/deltas", delta_body(site, self.new_blob(), 0, self.v0, "lock-0001"))
+        self.assertEqual(seen, [True])
+
+    def test_forwarded_for_used_only_from_the_trusted_proxy(self):   # review LOW
+        def redeem(forwarded: str) -> int:
+            request = urllib.request.Request(self.net.base + "/api/v1/redeem", method="POST", data=json.dumps(
+                {"code": "inv_nope", "accept_terms": terms.TERMS_SHA256}).encode(),
+                headers={"X-Forwarded-For": forwarded, "Content-Type": "application/json"})
+            try:
+                urllib.request.urlopen(request)
+            except urllib.error.HTTPError as error:
+                return error.code
+            return 200
+
+        self.net.app.trusted_proxies = {"127.0.0.1"}
+        self.assertEqual([redeem("9.9.9.9, 1.1.1.1") for _ in range(6)], [403] * 5 + [429])
+        self.assertEqual(redeem("1.1.1.1, 2.2.2.2"), 403)   # the rightmost hop is the client: its own bucket
+        self.net.app.trusted_proxies = set()
+        self.net.app.limiter.buckets.clear()
+        self.assertEqual([redeem(f"10.0.0.{i}") for i in range(6)], [403] * 5 + [429])   # spoofed hops ignored
+
+    def test_admin_api_needs_token_and_loopback_host(self):   # review LOW
+        with self.assertRaises(ApiError) as anonymous:
+            ApiClient(self.net.admin_url, retries=0).call("GET", "/admin/audit")
+        self.assertEqual(anonymous.exception.status, 401)
+        request = urllib.request.Request(self.net.admin_url + "/admin/audit",
+                                         headers={"Authorization": f"Bearer {self.net.admin_token}",
+                                                  "Host": "evil.example"})
+        with self.assertRaises(urllib.error.HTTPError) as rebinding:
+            urllib.request.urlopen(request)
+        self.assertEqual(rebinding.exception.code, 403)
+
+    def test_bad_numbers_are_400_and_the_image_is_pinned(self):   # review LOW
+        site = self.net.register("num")
+        for path in ("/api/v1/global?version=abc", "/api/v1/global?version=-1"):
+            with self.assertRaises(ApiError) as bad:
+                site.call("GET", path)
+            self.assertEqual(bad.exception.status, 400, path)
+        with self.assertRaises(ApiError) as bad:
+            self.val.call("GET", "/api/v1/validator/versions/x1")
+        self.assertEqual(bad.exception.status, 400)
+        dockerfile = (_common.REPO / "coordinator" / "Dockerfile").read_text()
+        self.assertRegex(dockerfile, r"(?m)^FROM python:[\w.-]+@sha256:[0-9a-f]{64}$")
 
 
 class ControlPlaneTests(unittest.TestCase):
@@ -435,12 +629,16 @@ class SignerTests(unittest.TestCase):
         self.assertEqual(plan["init_headers"]["x-goog-content-length-range"], "1234,1234")
         url = urllib.parse.urlsplit(plan["init_url"])
         query = dict(urllib.parse.parse_qsl(url.query))
-        self.assertEqual(query["X-Goog-SignedHeaders"], "host;x-goog-content-length-range;x-goog-resumable")
+        self.assertEqual(query["X-Goog-SignedHeaders"],
+                         "host;x-goog-content-length-range;x-goog-if-generation-match;x-goog-resumable")
+        self.assertEqual(plan["init_headers"]["x-goog-if-generation-match"], "0")   # create-only: no overwrite
+        self.assertLessEqual(int(query["X-Goog-Expires"]), 900)                    # short-lived initiation
         signature = bytes.fromhex(query.pop("X-Goog-Signature"))
         canonical_query = "&".join(f"{urllib.parse.quote(k, safe='-_.~')}={urllib.parse.quote(v, safe='-_.~')}"
                                    for k, v in sorted(query.items()))
         canonical = "\n".join(["POST", url.path, canonical_query, "host:storage.googleapis.com\n"
-                               "x-goog-content-length-range:1234,1234\nx-goog-resumable:start\n",
+                               "x-goog-content-length-range:1234,1234\nx-goog-if-generation-match:0\n"
+                               "x-goog-resumable:start\n",
                                query["X-Goog-SignedHeaders"], "UNSIGNED-PAYLOAD"])
         to_sign = "\n".join(["GOOG4-RSA-SHA256", "20130524T000000Z", "20130524/auto/storage/goog4_request",
                              hashlib.sha256(canonical.encode()).hexdigest()])

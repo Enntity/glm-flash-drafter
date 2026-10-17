@@ -36,9 +36,14 @@ to end across sites.
 - **Rounds.** A site starts from the current global weights, takes H inner AdamW steps (default 500, about 30
   minutes on one GB10 at round 2b's step time) with the trainer's `--sync-mode diloco --diloco-transport external`
   mode, and uploads `delta = global - local`. Its inner optimizer state stays on the site between rounds.
-- **Merge.** The validator averages accepted deltas weighted by tokens trained (self-reported, so capped at twice
-  the median of accepted deltas) and applies the outer step with learning rate 1 and no momentum: plain
-  averaging. The momentum option (OpenDiLoCo's lr 0.7 / Nesterov 0.9) stays
+- **Merge.** The validator averages accepted deltas weighted by tokens trained and applies the outer step with
+  learning rate 1 and no momentum: plain averaging. Tokens are self-reported, so they only count across sites:
+  each site's total in a round is capped at twice the median site total, every site weighs the same when fewer
+  than three sites are in the round, and a site may have at most 3 unmerged deltas. A delta nearly identical to
+  another one of the round (cosine above 0.995) is quarantined.
+- **Merge gate.** A merged global is evaluated on the private held-out set before it is published. If any group
+  is more than 1% below the best published global, or clearly below version 0, it is not published and its
+  deltas are held for the operator (not discarded). This stops small accepted drops from compounding. The momentum option (OpenDiLoCo's lr 0.7 / Nesterov 0.9) stays
   in the code, off.
 - **Why plain averaging.** In a round-3 A/B on the full model (two sites, three syncs, H = 500, Enntity's own
   data including internal agentic sessions), the momentum outer step fell well behind synchronous training, while
@@ -76,13 +81,13 @@ the token holder can make it and the coordinator can check it. It is a commitmen
 | | per round (defaults) |
 |---|---|
 | download | the global weights: 2.34 GB (bf16) |
-| upload | one delta: 2.34 GB (bf16) or 1.18 GB if the network sets int8 deltas (0.79% error on a real delta) |
+| upload | one delta: 1.18 GB (int8, the default; 0.79% error on a real delta) or 2.34 GB if the network sets bf16 |
 | training | H = 500 steps, about 30 minutes on one GB10 (round 2b: ~3.6 s/step) |
 | memory | the round-2b trainer peaked at 33 GB allocated; external DiLoCo mode adds a 4.7 GB fp32 copy of the global |
 | disk | FP8 activations at 24,600 bytes per captured token, deleted after the round; the delta until it has a verdict |
 | teacher text (recipe) | your own API key or server; the client's default spend cap is $10 per shard |
 
-A blocking bf16 exchange at 18 MB/s takes about 130 s each way.
+At 18 MB/s the int8 upload takes about 65 s and the bf16 download about 130 s.
 
 ## Trust model and validation
 
@@ -108,18 +113,24 @@ Checks, in order:
    against the base on a **private, rotating held-out set** that is not in the repository or on the coordinator.
 5. **Conservative verdicts** (`validation.Thresholds`): accept unless a held-out group's expected accepted length
    drops; a drop of more than 1% is borderline (merged at half weight, or held for the operator); only a drop of
-   more than 3% is a rejection. Per-category numbers are reported but too small to decide on.
+   more than 3% is a rejection. A missing or non-finite score is a rejection (the check fails closed).
+   Per-category numbers are recorded but too small to decide on. Sites see only the decision and a reason code
+   with a fixed explanation, never held-out numbers, so the held-out set cannot be probed through verdicts.
 6. **Quarantine, not deletion.** Rejected deltas stay in storage with a machine-readable code and a human reason
    the site can read (`drafter-join status`). When the validator's version changes, the coordinator re-queues every
    quarantined or held delta automatically.
 
-Uploads are safetensors tensors only; nothing uploaded is executed or unpickled. The coordinator never loads
+Every published global is signed with the operator's ed25519 key; sites pin the key when they register and
+refuse unsigned or wrongly signed globals. Uploads are safetensors tensors only; nothing uploaded is executed or
+unpickled. A delta the validator cannot process is quarantined as `validator_error` (re-validated after the next
+validator update) instead of stopping the queue. Revoking a site quarantines its unmerged deltas. The coordinator never loads
 weights (a test enforces that it imports no tensor library).
 
 ## What we promise contributors
 
 - **Canary first.** A site's first cycle, and the first after any trainer, config or validator version change, is
-  a short run (20 steps by default) whose delta goes through the full validation path. Long rounds start only
+  a short run (20 steps by default, at most 50) whose delta goes through the full validation path. The coordinator,
+  not the client, decides that a delta is a canary, and refuses a long delta from a site that still owes one. Long rounds start only
   after it is accepted; `drafter-join setup` ends with it.
 - **No late version surprises.** Pins are checked by the client before training and by the coordinator at upload
   initiation, never after the bytes have moved.
@@ -143,7 +154,8 @@ at initiation, a validator bug fixed and re-validated, duplicate uploads, lease 
 
 The coordinator serves a public dashboard at its base path: current global version, live sites (display name or
 "anonymous", status, throughput), a leaderboard of tokens received and deltas accepted, the held-out curve per
-group and category over versions, the operator-published Atlas benchmark table, the weakest categories ("wanted"),
+group over versions (rounded, at least an hour old), the operator-published Atlas benchmark table, the weakest
+groups ("wanted"),
 aggregate reasons for held or quarantined deltas, and network totals. A "how it works" page explains validation.
 Heartbeats carry only phase, round, version, token counters, throughput, GPU power, MFU and GPU count; any other
 field is refused. The audit log (registrations, invite use, verdicts, revocations) is admin-only.
@@ -158,4 +170,4 @@ field is refused. The audit log (registrations, invite use, verdicts, revocation
 - Spot checks for real recipes: the operator has to generate and capture the shard itself, and hosted sampling
   is not deterministic, so a replay can only be compared approximately (by direction). The replay hook exists and
   is tested on a stand-in.
-- Overlapped (streaming) syncs, int8 deltas by default, robust aggregation (median or trimmed mean).
+- Overlapped (streaming) syncs, robust aggregation (median or trimmed mean).
