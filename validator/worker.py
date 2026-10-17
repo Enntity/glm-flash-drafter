@@ -16,6 +16,7 @@ default) goes to object storage through a signed upload.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import urllib.error
@@ -35,6 +36,11 @@ from enntity_drafter.validation import (
     VALIDATOR_VERSION, CheckFailed, StreamWriter, Thresholds, candidate_weights, check_delta, judge, layout,
     norm_bounds, read_header, weights_stamp,
 )
+
+
+def score(metrics: dict[str, float]) -> float:
+    groups = [v for k, v in metrics.items() if "." not in k]
+    return sum(groups) / max(len(groups), 1)
 
 
 def merge_weights(items: list[dict[str, Any]], current: int, thresholds: Thresholds) -> list[float]:
@@ -60,7 +66,7 @@ def merge_weights(items: list[dict[str, Any]], current: int, thresholds: Thresho
 
 
 def _decode(handle, name: str, shape: tuple[int, ...], dtype: str) -> torch.Tensor:
-    keys = [name + suffix for suffix in dl.INT8_KEYS] if dtype == "int8" else [name]
+    keys = dl.delta_keys(name, dtype, set(handle.keys()))
     return dl.decode_named({k: handle.get_tensor(k) for k in keys}, {name: shape}, dtype)[name]
 
 
@@ -117,6 +123,28 @@ def merge_streamed(master: Path, deltas: list[tuple[Path, float]], out_master: P
     return sha_master, published.close()
 
 
+SKETCH_PER_TENSOR = 256
+
+
+def sketch(delta_path: Path, base_path: Path) -> torch.Tensor:
+    """A fixed random sample of every tensor's delta values (the same coordinates for every delta): cosine of two
+    sketches estimates the cosine of the deltas, so near-duplicates are found without re-reading old files."""
+
+    dtype = json.loads(read_header(delta_path)["__metadata__"]["delta"])["delta_dtype"]
+    parts = []
+    with guarded_safe_open(delta_path, "drafter") as handle:
+        for name, (_, shape) in layout(base_path).items():
+            value = _decode(handle, name, shape, dtype).reshape(-1)
+            generator = torch.Generator().manual_seed(int(hashlib.sha256(name.encode()).hexdigest()[:12], 16))
+            parts.append(value[torch.randint(0, value.numel(), (min(value.numel(), SKETCH_PER_TENSOR),),
+                                             generator=generator)])
+    return torch.cat(parts).double()
+
+
+def sketch_cosine(a: torch.Tensor, b: torch.Tensor) -> float:
+    return float((a @ b) / max(float(a.norm() * b.norm()), 1e-300))
+
+
 def cosine(a_path: Path, b_path: Path, base_path: Path) -> float:
     """Cosine similarity of two delta files of the model in ``base_path`` (streamed)."""
 
@@ -137,7 +165,7 @@ class Validator:
                  outer_momentum: float = 0.0, outer_nesterov: bool = True, heldout_id: str = "",
                  keep_local: int = 9, replayer: Callable[[dict[str, Any], Path], Path] | None = None,
                  spot_check_rate: float = 0.0, spot_cosine: float = 0.5, clock: Callable[[], float] = time.time,
-                 log: Callable[[str], None] = print, signing_key: Any = None):
+                 log: Callable[[str], None] = print, signing_key: Any = None, eval_repeats: int = 3):
         self.api, self.workdir, self.evaluate = api, Path(workdir), evaluate
         self.requirements = dict(requirements or {})
         self.thresholds, self.version, self.publish_dtype = thresholds or Thresholds(), version, publish_dtype
@@ -147,7 +175,8 @@ class Validator:
         self.replayer, self.spot_check_rate, self.spot_cosine = replayer, spot_check_rate, spot_cosine
         self.rng = random.Random(0)
         self.signing_key = signing_key   # cryptography Ed25519PrivateKey: signs every published global
-        for sub in ("versions", "inbox", "tmp"):
+        self.eval_repeats = eval_repeats  # evaluations of version 0 that estimate the held-out noise margin
+        for sub in ("versions", "inbox", "tmp", "sketches"):
             (self.workdir / sub).mkdir(parents=True, exist_ok=True)
         self.state_path = self.workdir / "state.json"
         self.state = json.loads(self.state_path.read_text()) if self.state_path.is_file() else {"history": []}
@@ -205,10 +234,14 @@ class Validator:
         else:
             dl.save_weights(self.published(0), weights, self.publish_dtype, stamp, {"version": 0})
         metrics = self.metrics(sha256_file(self.published(0)), self.published(0))
-        self.state.update(reference_metrics=metrics, best_metrics=dict(metrics))
+        repeats = [metrics] + [self.evaluate(self.published(0)) for _ in range(self.eval_repeats - 1)]
+        spread = [(max(r[g] for r in repeats) - min(r[g] for r in repeats)) / abs(metrics[g])
+                  for g in metrics if "." not in g and metrics[g]]
+        self.state.update(reference_metrics=metrics, noise=2.0 * max(spread, default=0.0))   # eval noise margin
         return self._publish(0, [], self.published(0), metrics)
 
-    def _publish(self, version: int, merged: list[dict[str, Any]], path: Path, metrics: dict[str, float]) -> int:
+    def _publish(self, version: int, merged: list[dict[str, Any]], path: Path, metrics: dict[str, float],
+                 forced: bool = False) -> int:
         sha, size = sha256_file(path), path.stat().st_size
         self.state.setdefault("sha", {})[str(version)] = sha
         uploads = self.state.setdefault("uploads", {})
@@ -228,11 +261,13 @@ class Validator:
                 "norm_bounds": norm_bounds(self.state["history"], self.thresholds)}
         if self.signing_key is not None:
             body["signature"] = self.signing_key.sign(terms.global_message(version, sha)).hex()
+        if forced:
+            body["forced"] = True
         self.api.call("POST", f"/api/v1/validator/versions/{version}/publish", body)
         uploads.pop(f"{version}-{sha}", None)
-        best = self.state.setdefault("best_metrics", {})
-        for group, value in metrics.items():
-            best[group] = max(best.get(group, value), value)
+        best = self.state.get("best")   # one coherent version, never a per-group maximum across versions
+        if best is None or score(metrics) > score(best["metrics"]):
+            self.state["best"] = {"version": version, "metrics": metrics}
         self.state.update(current=version, last_merge=self.clock())
         self._save()
         self._prune(version)
@@ -303,9 +338,19 @@ class Validator:
             except Exception as error:  # noqa: BLE001
                 raise CheckFailed("malformed", f"the delta file could not be read ({type(error).__name__})") from error
             verdict["checks"] = {"rms": stats["rms"], "max_abs": stats["max_abs"]}
-            for other in sorted((self.workdir / "inbox").glob("*.safetensors")):   # accepted, awaiting the merge
-                if other != path and cosine(path, other, base) > self.thresholds.near_duplicate:
-                    raise CheckFailed("near_duplicate", f"nearly identical to delta {other.stem} of this round")
+            mine = sketch(path, base)
+            relaxed = None
+            for other, info in self.state.setdefault("sketches", {}).items():   # accepted, awaiting the merge
+                if other == item["delta_id"] or not (self.workdir / "sketches" / f"{other}.sketch.safetensors").is_file():
+                    continue
+                theirs = dl.load_weights(self.workdir / "sketches" / f"{other}.sketch.safetensors")[0]["sketch"].double()
+                if theirs.shape != mine.shape or sketch_cosine(mine, theirs) <= self.thresholds.near_duplicate:
+                    continue
+                if (item["mode"] == "recipe" and item.get("shard_id") == info.get("shard_id")
+                        and item.get("lease_id") and info.get("lease_id") and item["lease_id"] != info["lease_id"]):
+                    relaxed = other   # the same shard re-leased after a lease expired: fine, at reduced weight
+                    continue
+                raise CheckFailed("near_duplicate", f"nearly identical to delta {other} of this round")
             if (self.replayer is not None and item["mode"] == "recipe" and claim.get("recipe")
                     and (item["canary"] or self.rng.random() < self.spot_check_rate)):
                 similarity = cosine(path, self.replayer(claim, base), base)
@@ -317,6 +362,8 @@ class Validator:
             cand = self.evaluate(candidate)
             base_metrics = self.metrics(item["base_sha256"], base)
             decision, code, message, _ = judge(base_metrics, cand, self.thresholds)
+            if relaxed is not None and decision == "accept":
+                decision, code, message = "reduce", "duplicate_lease", f"same shard as {relaxed}, another lease"
             verdict.update(metrics=cand, base_metrics=base_metrics)
         except CheckFailed as failure:
             decision, code, message = "reject", failure.code, failure.message
@@ -326,9 +373,15 @@ class Validator:
                        weight_factor=self.thresholds.reduce_weight if decision == "reduce" else 1.0)
         if decision in ("accept", "reduce"):
             self.state["history"] = (self.state["history"] + [verdict["checks"]["rms"]])[-200:]
-            self._save()
             if item["canary"]:   # canaries are not merged: never compare later deltas against them
                 path.unlink(missing_ok=True)
+            else:   # stored once; later deltas of the round are compared against it
+                dl._save(self.workdir / "sketches" / f"{item['delta_id']}.sketch.safetensors", {"sketch": mine.float()},
+                         {dl.SCRATCH_STAMP_KEY: json.dumps({"lineage_root": "enntity-scratch-init",
+                                                            "warm_start": "none", "kind": "sketch"})})
+                self.state["sketches"][item["delta_id"]] = {"shard_id": item.get("shard_id"),
+                                                            "lease_id": item.get("lease_id"), "site": item["site"]}
+            self._save()
         else:
             path.unlink(missing_ok=True)   # the coordinator keeps the object (quarantine)
         self.api.call("POST", f"/api/v1/validator/deltas/{item['delta_id']}/verdict", verdict)
@@ -344,7 +397,8 @@ class Validator:
         """Merge accepted deltas into the next global.  The inputs (deltas and weights) are saved before merging, so
         a crash and re-run produce the same file; the result must pass the merge gate before it is published."""
 
-        current = self.hello()["current"]
+        reply = self.hello()
+        current, force = reply["current"], bool(reply.get("force_merge"))
         if current is None:
             return None
         version = current["version"]
@@ -371,6 +425,7 @@ class Validator:
                             raise
                         self._late(item["delta_id"], "reject", "hash_mismatch", "stored object changed after "
                                                                                 "acceptance")
+                        self._forget_sketches([item])
                         continue
                 usable.append(item)
             if not usable:
@@ -399,32 +454,42 @@ class Validator:
         published = self.published(version + 1)
         metrics = self.metrics(sha256_file(published), published)
         gate = self._gate(metrics)
-        if gate is not None:   # refuse to publish; hold the deltas for the operator, never discard them
+        if gate is not None and force:   # the operator released these deltas with --publish (audited)
+            self.log(f"merge gate overridden by the operator: {gate}")
+        elif gate is not None:   # refuse to publish; hold the deltas for the operator, never discard them
             for item in plan["items"]:
                 self._late(item["delta_id"], "hold", "merge_regression", gate)
             for path in (self.master(version + 1), published, momentum_out, *files):
                 path.unlink(missing_ok=True)
+            self._forget_sketches(plan["items"])
             self.state["pending_merge"] = None
             self._save()
             self.log(f"merge into v{version + 1} refused: {gate}")
             return None
-        result = self._publish(version + 1, plan["items"], published, metrics)
+        result = self._publish(version + 1, plan["items"], published, metrics, forced=gate is not None)
         self.state["pending_merge"] = None
+        self._forget_sketches(plan["items"])
         self._save()
         for path in files:
             path.unlink(missing_ok=True)
         return result
 
-    def _gate(self, metrics: dict[str, float]) -> str | None:
-        """None if a merged global may be published: no group more than ``gate_drop`` below the best published
-        global, and no clear regression against the fixed reference (version 0)."""
+    def _forget_sketches(self, items: list[dict[str, Any]]) -> None:
+        for item in items:
+            self.state.get("sketches", {}).pop(item["delta_id"], None)
+            (self.workdir / "sketches" / f"{item['delta_id']}.sketch.safetensors").unlink(missing_ok=True)
 
-        gate = Thresholds(hold_drop=self.thresholds.gate_drop, reject_drop=self.thresholds.gate_drop)
-        best = self.state.get("best_metrics")
+    def _gate(self, metrics: dict[str, float]) -> str | None:
+        """None if a merged global may be published: no group more than max(``gate_drop``, measured eval noise)
+        below the best published version (its whole metric vector), and no clear regression against version 0."""
+
+        margin = max(self.thresholds.gate_drop, float(self.state.get("noise", 0.0)))
+        gate = Thresholds(hold_drop=margin, reject_drop=margin)
+        best = self.state.get("best")
         if best:
-            decision, _, message, _ = judge(best, metrics, gate)
+            decision, _, message, _ = judge(best["metrics"], metrics, gate)
             if decision != "accept":
-                return f"below the best published global ({message})"
+                return f"below the best published global v{best['version']} ({message})"
         reference = self.state.get("reference_metrics")
         if reference:
             decision, _, message, _ = judge(reference, metrics, self.thresholds)

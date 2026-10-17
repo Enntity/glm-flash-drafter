@@ -56,7 +56,35 @@ CANARY_ROWS = 16        # prompts of the claimed shard a recipe canary generates
 
 
 class JoinError(RuntimeError):
-    """A stop with an actionable message (printed without a traceback)."""
+    """An actionable message (printed without a traceback).  ``wait``: seconds after which ``run`` simply continues
+    (the state already says what happens next); None: stop, someone has to act."""
+
+    def __init__(self, message: str, wait: float | None = None):
+        super().__init__(message)
+        self.wait = wait
+
+
+#: Every error code the coordinator (and the transfer client) can return, and what happens to a finished delta.
+#: Nothing here discards a delta: retry keeps the cycle and tries again later; park keeps the delta while the
+#: required canary runs, then uploads it; new_id registers the same file again; aside keeps the file under
+#: <work>/unmergeable and starts a new cycle; aside_stop does the same and stops; stop keeps everything untouched
+#: and stops until someone acts (for example a revoked token).
+UPLOAD_ACTIONS: dict[str, tuple[str, float | None]] = {
+    "rate_limited": ("retry", 60), "low_disk": ("retry", 600), "too_many_pending": ("retry", 300),
+    "too_many_uploads": ("retry", 300), "canary_pending": ("retry", 120), "conflict": ("retry", 10),
+    "upload_incomplete": ("retry", 30), "unreachable": ("retry", 300), "internal": ("retry", 300),
+    "upload_failed": ("retry", 60), "no_url": ("retry", 60), "download_hash": ("retry", 60),
+    "download_size": ("retry", 60),
+    "canary_required": ("park", 0),
+    "client_id_reused": ("new_id", 0), "not_found": ("new_id", 0),
+    "base_unknown": ("aside", 0), "base_retired": ("aside", 0), "shard_not_leased": ("aside", 0),
+    "duplicate": ("aside", 0), "version_mismatch": ("aside", 0), "no_version": ("aside", 0),
+    "too_large": ("aside_stop", None), "attestation_invalid": ("aside_stop", None),
+    "bad_request": ("aside_stop", None), "bad_json": ("aside_stop", None), "length_required": ("aside_stop", None),
+    "auth_required": ("stop", None), "auth_invalid": ("stop", None), "invite_invalid": ("stop", None),
+    "terms_required": ("stop", None), "bad_display_name": ("stop", None), "bad_host": ("stop", None),
+    "not_pending": ("stop", None), "not_validating": ("stop", None), "version_order": ("stop", None),
+}
 
 
 def say(message: str) -> None:
@@ -267,8 +295,9 @@ class Site:
         cycle = self.state.get("cycle") or {}
         body = {"phase": self.phase, "round": self.state["rounds"], "tokens": float(self.state["tokens"]),
                 "client": CLIENT_VERSION, "gpus": int(self.opts.gpus)}
-        if cycle.get("base"):
-            body["version"] = int(cycle["base"]["version"])
+        bases = [c["base"]["version"] for c in [cycle, *self.state.get("parked", [])] if c.get("base")]
+        if bases:   # the oldest global still in use here: the coordinator keeps it while this site is alive
+            body["version"] = int(min(bases))
         if cycle.get("shard"):
             body["shard_id"] = cycle["shard"]["id"]
         for key in ("tokens_per_s", "gpu_w", "mfu", "step"):
@@ -402,10 +431,13 @@ class Site:
         req = self.requirements()
         self._drain_outbox()
         cycle = self.state.get("cycle")
+        if cycle is None and not req["canary_required"] and self.state.get("parked"):
+            cycle = self.state["cycle"] = self.state["parked"].pop(0)   # a delta that waited for the canary
+            self.save()
         if cycle is None:
             if not req["canary_required"] and req.get("open_deltas", 0) >= req.get("max_open_deltas", 10**9):
                 raise JoinError("waiting: this site's earlier deltas are not merged yet (the coordinator limits "
-                                "unmerged deltas per site)")
+                                "unmerged deltas per site)", wait=300)
             cycle = {"client_id": uuid.uuid4().hex, "canary": bool(req["canary_required"]), "stage": "data"}
             key = f"{req['trainer']}|{req['config_sha256']}"
             if self.state.get("trainer_key") not in (None, key):   # pins changed: the old optimizer state is void
@@ -419,7 +451,8 @@ class Site:
                 if shard is None:
                     self.state["cycle"] = None
                     self.save()
-                    raise JoinError("no recipe shard is open right now; retry later or run with --mode byo")
+                    raise JoinError("no recipe shard is open right now; retry later or run with --mode byo",
+                                    wait=300)
                 cycle["shard"] = shard
                 self.save()
             cycle["data"] = self._data(cycle)
@@ -457,29 +490,29 @@ class Site:
                     "mode": self.opts.mode, "canary": cycle["canary"], "meta": cycle["meta"]}
             if cycle.get("shard"):
                 body["shard_id"] = cycle["shard"]["id"]
+                if cycle["shard"].get("lease_id"):
+                    body["lease_id"] = cycle["shard"]["lease_id"]
             elif self.opts.tag:
                 body["tag"] = self.opts.tag
             body["attestation"] = terms.sign_attestation(self.token, {**body, "shard_id": body.get("shard_id"),
                                                                       "tag": body.get("tag")})
             try:
                 reply = self.api.call("POST", "/api/v1/deltas", body)
-            except ApiError as error:
-                if error.code not in ("version_mismatch", "base_retired", "base_unknown"):
-                    raise
-                raise self._set_aside(cycle, "unmergeable", f"the network changed during this round ({error.code}: "
-                                                            f"{error.message})") from error
-            if reply["state"] == "abandoned":   # an upload left for more than a day: register it again
-                cycle["client_id"] = uuid.uuid4().hex
-                cycle.pop("transfer", None)
+                if reply["state"] == "abandoned":   # an upload left for more than a day: register it again
+                    cycle["client_id"] = uuid.uuid4().hex
+                    cycle.pop("transfer", None)
+                    self.save()
+                    return self.cycle()
+                cycle["delta_id"] = reply["delta_id"]
                 self.save()
-                return self.cycle()
-            cycle["delta_id"] = reply["delta_id"]
-            self.save()
-            if reply["state"] == "uploading":
-                transfer = cycle.setdefault("transfer", {})
-                parts = upload_file(cycle["delta"], reply["upload"], lambda numbers: self.api.call(
-                    "POST", f"/api/v1/uploads/{reply['upload_id']}/refresh", {"parts": numbers}), transfer, self.save)
-                self.api.call("POST", f"/api/v1/deltas/{cycle['delta_id']}/complete", {"parts": parts})
+                if reply["state"] == "uploading":
+                    transfer = cycle.setdefault("transfer", {})
+                    parts = upload_file(cycle["delta"], reply["upload"], lambda numbers: self.api.call(
+                        "POST", f"/api/v1/uploads/{reply['upload_id']}/refresh", {"parts": numbers}), transfer,
+                        self.save)
+                    self.api.call("POST", f"/api/v1/deltas/{cycle['delta_id']}/complete", {"parts": parts})
+            except ApiError as error:
+                raise self.upload_error(cycle, error) from error
             cycle["stage"] = "verdict" if cycle["canary"] else "done"
             self.state["tokens"] += cycle["meta"]["tokens"]
             self.save()
@@ -507,6 +540,31 @@ class Site:
         self._drain_outbox()
         self.set_phase("idle")
         return {"delta_id": cycle["delta_id"], "canary": cycle["canary"], "base_version": cycle["base"]["version"]}
+
+    def upload_error(self, cycle: dict[str, Any], error: ApiError) -> JoinError:
+        """Apply :data:`UPLOAD_ACTIONS` to a failed upload of a finished delta; never discards it."""
+
+        action, wait = UPLOAD_ACTIONS.get(error.code, ("aside_stop", None))
+        why = f"{error.code}: {error.message}"
+        if action == "retry":
+            return JoinError(f"waiting ({why}); the delta is kept and its upload resumes", wait)
+        if action == "park":
+            self.state.setdefault("parked", []).append(cycle)
+            self.state["cycle"] = None
+            self.save()
+            return JoinError(f"waiting ({why}); the finished delta is kept and uploaded right after the canary", 0)
+        if action == "new_id":
+            cycle["client_id"] = uuid.uuid4().hex
+            for key in ("transfer", "delta_id"):
+                cycle.pop(key, None)
+            self.save()
+            return JoinError(f"waiting ({why}); registering the same delta again", 0)
+        if action in ("aside", "aside_stop"):
+            kept = self._set_aside(cycle, "unmergeable", why)
+            kept.wait = 0 if action == "aside" else None
+            return kept
+        return JoinError(f"stopped ({why}); the delta and this cycle are kept, and the upload resumes on the next "
+                         "`drafter-join run` once this is resolved")
 
     @staticmethod
     def shard_id(shard: dict[str, Any]) -> str:
@@ -597,10 +655,10 @@ class Site:
                 try:
                     result = self.cycle()
                 except JoinError as error:
-                    if "no recipe shard" not in str(error) and not str(error).startswith("waiting"):
+                    if error.wait is None:
                         raise
                     say(str(error))
-                    self.sleep(300)
+                    self.sleep(error.wait)
                     continue
                 done += not result["canary"]
         finally:
@@ -805,7 +863,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if opts.cmd == "status":
             site = site_from(opts)
-            print(json.dumps({"local": {k: site.state.get(k) for k in ("rounds", "tokens", "outbox", "cycle")},
+            print(json.dumps({"local": {k: site.state.get(k) for k in ("rounds", "tokens", "outbox", "cycle", "parked")},
                               "pins": site.pins(), "coordinator": site.api.call("GET", "/api/v1/me")}, indent=1))
             return 0
         if opts.teacher is None:

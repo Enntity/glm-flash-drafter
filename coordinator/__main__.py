@@ -21,6 +21,15 @@ from .server import App, make_server
 from .service import Config, Service
 
 
+def check_proxy_config(env: dict[str, str]) -> None:
+    """Behind a reverse proxy every connection comes from the proxy: without its address configured, all clients
+    would share one rate-limit bucket (one client could exhaust invite redemption for everyone)."""
+
+    if env.get("DRAFTER_PROXY_MODE") == "1" and not env.get("DRAFTER_TRUSTED_PROXIES", "").strip():
+        raise SystemExit("DRAFTER_PROXY_MODE=1 needs DRAFTER_TRUSTED_PROXIES: the reverse proxy's address as this "
+                         "container sees it (for Traefik, its address on the shared Docker network)")
+
+
 def build_service(env: dict[str, str] | None = None) -> Service:
     env = dict(os.environ if env is None else env)
     config = Config.from_env(env)
@@ -65,10 +74,14 @@ def main(argv: list[str] | None = None) -> None:
     q.add_argument("json", help="JSON text, or @file.json")
     q = sub.add_parser("get")
     q.add_argument("key")
-    q = sub.add_parser("release", help="decide a held delta")
+    q = sub.add_parser("release", help="decide a held or quarantined delta")
     q.add_argument("delta_id")
-    q.add_argument("decision", choices=["accept", "reject"])
+    q.add_argument("decision", choices=["accept", "reject", "revalidate"])
     q.add_argument("--weight-factor", type=float, default=1.0)
+    q.add_argument("--publish", action="store_true", help="the next merge skips the merge gate once (audited)")
+    q = sub.add_parser("deltas", help="list deltas, e.g. --state quarantined")
+    q.add_argument("--state", default=None)
+    sub.add_parser("attention", help="held deltas, unreviewed quarantines, pending gate overrides")
     sub.add_parser("admin-token", help="issue a new admin API token (printed once; replaces the old one)")
     sub.add_parser("maintenance", help="abort abandoned uploads, purge expired delta objects, retire globals")
     q = sub.add_parser("audit")
@@ -78,6 +91,10 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.cmd == "serve":
         env = os.environ
+        check_proxy_config(dict(env))
+        if not env.get("DRAFTER_TRUSTED_PROXIES", "").strip():
+            print("coordinator: WARNING no DRAFTER_TRUSTED_PROXIES; rate limits are per connection. Behind a proxy, "
+                  "set DRAFTER_PROXY_MODE=1 and DRAFTER_TRUSTED_PROXIES.", flush=True)
         public = make_server(App(service, env.get("DRAFTER_BASE_PATH", "/drafter")),
                              env.get("DRAFTER_HOST", "0.0.0.0"), int(env.get("DRAFTER_PORT", "8080")))
         admin = make_server(App(service, admin=True), "127.0.0.1", int(env.get("DRAFTER_ADMIN_PORT", "8081")))
@@ -127,7 +144,11 @@ def main(argv: list[str] | None = None) -> None:
     elif args.cmd == "maintenance":
         result = service.maintenance()
     elif args.cmd == "release":
-        result = service.release_held(args.delta_id, args.decision, args.weight_factor)
+        result = service.release_held(args.delta_id, args.decision, args.weight_factor, args.publish)
+    elif args.cmd == "deltas":
+        result = service.list_deltas(args.state)
+    elif args.cmd == "attention":
+        result = service.attention()
     else:
         result = service.audit_log(args.limit)
     json.dump({"ok": True} if result is None else result, sys.stdout, indent=1)

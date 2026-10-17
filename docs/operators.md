@@ -14,14 +14,24 @@ cd coordinator
 DRAFTER_PUBLIC_URL=https://<your host>/drafter docker compose up -d --build
 ```
 
-- Put a TLS reverse proxy in front of `127.0.0.1:8080` and route `<base path>/*` to it with the prefix kept. Set
-  `DRAFTER_TRUSTED_PROXIES` to the proxy's address as the container sees it: only requests from it have their
-  rightmost `X-Forwarded-For` entry used as the client address for rate limits. IPs are only held in memory.
+- Put a TLS reverse proxy in front of `127.0.0.1:8080` and route `<base path>/*` to it with the prefix kept.
+  **Set `DRAFTER_TRUSTED_PROXIES`** to the proxy's address as the container sees it (for Traefik: its address on
+  the shared Docker network). Only requests from that address have their rightmost `X-Forwarded-For` entry used
+  as the client address for rate limits; without it every client would share one bucket. The compose file sets
+  `DRAFTER_PROXY_MODE=1`, which refuses to start until the variable is set; outside proxy mode a missing value is
+  logged as a warning and limits are per connection. IPs are only held in memory. Invite redemption allows a
+  burst of 20 per client address, then one per minute.
 - The public router serves the dashboard, the public JSON API, the site and validator APIs and, with the local
   backend only, signed blob transfers. **The admin API listens on 127.0.0.1:8081 inside the container and is never
   published**; it also requires the admin token (written to `/data/admin-token`, mode 0600, on first start;
   `python -m coordinator admin-token` replaces it) and a loopback `Host`. The CLI,
   `docker compose exec coordinator python -m coordinator <command>`, acts on the database directly.
+- Review queue: `python -m coordinator attention` lists held deltas and unreviewed quarantines (also
+  `GET /admin/attention`); `deltas --state quarantined` lists them all; `release ID accept|reject|revalidate`
+  decides one (`--publish` makes the next merge skip the merge gate once, recorded as `merge.gate_overridden`).
+  Validator errors are retried automatically with backoff (1 min doubling to 1 h, 5 attempts) before they need a
+  review. Anything held or unreviewed for 24 h is escalated (`ATTENTION` in the log, `delta.needs_review` in the
+  audit log). Quarantined objects are deleted only after an operator reviewed them.
 - Maintenance runs every 10 minutes (`python -m coordinator maintenance` by hand): it aborts uploads left open for
   more than `DRAFTER_UPLOAD_TTL_S` (24 h; S3 multipart uploads are aborted, GCS sessions lapse), deletes delta
   objects 7 days after their merge and 30 days after quarantine (`DRAFTER_DELTA_RETENTION_S`,
@@ -110,9 +120,11 @@ python -m validator run   (same flags)
   delta has waited `--round-timeout-s`. The merge streams one tensor at a time; the fp32 master stays in the workdir
   and the published copy (`--publish-dtype bf16`) goes to storage. The merge inputs (deltas and weights) are saved
   before merging and outer momentum is kept per version, so a crash and re-run produce the same file.
-- **Merge gate.** Each merged global is evaluated on the held-out set before publishing. More than 1% below the
-  best published global on any group, or clearly below version 0, and it is not published: its deltas are held
-  (`python -m coordinator release ...` after review).
+- **Merge gate.** Each merged global is evaluated on the held-out set before publishing and compared with the
+  best published version (one version's whole score vector, not a per-group maximum) using a margin of
+  max(1%, measured eval noise; `init` evaluates version 0 three times to measure it), and with version 0. A
+  regressing merge is not published: its deltas are held (`python -m coordinator release ID accept --publish`
+  overrides the gate once, audited).
 - **The held-out set is private**: never in the repository, never on the coordinator. Build it from prompts no
   shard recipe can produce (for example builder runs with an unpublished seed) and rotate it; its manifest hash is
   recorded with every version, so a rotation is visible in the curve, and cached base scores are recomputed.

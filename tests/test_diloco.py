@@ -66,6 +66,21 @@ class CodecTests(unittest.TestCase):
         self.assertLessEqual(float((decoded - flat).abs().max()), float(flat.abs().max()) / 254 + 1e-9)
         self.assertEqual(dl.payload_bytes(payload), 4 * dl.INT8_BLOCK + 4 * 4)   # 1 B/value + fp32 scale/block
 
+    def test_int8_falls_back_to_bf16_on_heavy_tailed_tensors(self):   # re-review: int8 error on real deltas
+        generator = torch.Generator().manual_seed(4)
+        torch.manual_seed(4)
+        heavy = torch.distributions.StudentT(torch.tensor(1.2)).sample((40_000,)) * 1e-4   # occasional huge values
+        normal = torch.randn(40_000, generator=generator) * 1e-4
+        deltas = {"heavy": heavy.view(200, 200), "normal": normal.view(200, 200)}
+        plain = dl.decode(dl.encode(heavy, "int8"), heavy.numel())
+        self.assertGreater(rel(plain, heavy), dl.INT8_MAX_REL_ERR)   # blockwise int8 alone would lose too much
+        encoded = dl.encode_named(deltas, "int8")
+        self.assertIn("heavy" + dl.INT8_FALLBACK, encoded)
+        self.assertIn("normal::q", encoded)
+        decoded = dl.decode_named(encoded, {k: tuple(v.shape) for k, v in deltas.items()}, "int8")
+        for key, value in deltas.items():
+            self.assertLessEqual(rel(decoded[key], value), dl.INT8_MAX_REL_ERR, key)
+
     def test_named_delta_files(self):
         torch.manual_seed(3)
         deltas = {"a.weight": torch.randn(7, 300) * 1e-3, "b": torch.randn(5) * 1e-3}

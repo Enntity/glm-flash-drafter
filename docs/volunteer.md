@@ -81,7 +81,7 @@ the token holder can make it and the coordinator can check it. It is a commitmen
 | | per round (defaults) |
 |---|---|
 | download | the global weights: 2.34 GB (bf16) |
-| upload | one delta: 1.18 GB (int8, the default; 0.79% error on a real delta) or 2.34 GB if the network sets bf16 |
+| upload | one delta: about 1.18 GB (int8, the default; tensors whose int8 error would exceed 1%, such as heavy-tailed ones, are stored in bf16 instead) or 2.34 GB if the network sets bf16 |
 | training | H = 500 steps, about 30 minutes on one GB10 (round 2b: ~3.6 s/step) |
 | memory | the round-2b trainer peaked at 33 GB allocated; external DiLoCo mode adds a 4.7 GB fp32 copy of the global |
 | disk | FP8 activations at 24,600 bytes per captured token, deleted after the round; the delta until it has a verdict |
@@ -133,7 +133,15 @@ weights (a test enforces that it imports no tensor library).
   not the client, decides that a delta is a canary, and refuses a long delta from a site that still owes one. Long rounds start only
   after it is accepted; `drafter-join setup` ends with it.
 - **No late version surprises.** Pins are checked by the client before training and by the coordinator at upload
-  initiation, never after the bytes have moved.
+  initiation, never after the bytes have moved. A round finished against a still-retained base is accepted even if
+  the validator version changed meanwhile; the canary runs in the next cycle. Every error code the coordinator can
+  return maps to a client action that keeps the finished delta (retry later, upload after the canary, register
+  again, or set aside locally with a message); a test enumerates them all.
+- **Honest failures are retried.** A validator failure on a delta is retried automatically with backoff; after
+  repeated failures it waits for an operator, who can re-validate, accept or reject it. Quarantined deltas are
+  never deleted before an operator reviewed them, and the site sees the state (`drafter-join status`). Two
+  near-identical deltas from different leases of the same shard (a re-lease after a lease expired) both count,
+  the second at reduced weight.
 - **No timing rejections.** Deltas against older globals are accepted, down-weighted by 0.5 per version behind,
   as long as the base is retained. The coordinator keeps the newest 8 globals, every base of an unmerged or
   quarantined delta, and every version a site reported training from in the last 12 hours. Shard leases are

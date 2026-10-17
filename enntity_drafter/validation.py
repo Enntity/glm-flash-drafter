@@ -111,8 +111,8 @@ def check_delta(delta_path: str | Path, base_path: str | Path, expect: dict[str,
             raise CheckFailed("version_mismatch", f"{key} {meta.get(key)!r} != required {expect[key]!r}")
     base = layout(base_path)
     shapes = {name: shape for name, (_, shape) in base.items()}
-    want = {k: (ST_DTYPES[d], s) for k, (d, s) in dl.delta_layout(shapes, meta["delta_dtype"]).items()}
     got = {k: v for k, v in layout(delta_path).items()}
+    want = {k: (ST_DTYPES[d], s) for k, (d, s) in dl.delta_layout(shapes, meta["delta_dtype"], got).items()}
     if got != want:
         missing = sorted(set(want) - set(got))[:3]
         wrong = sorted(k for k in set(want) & set(got) if want[k] != got[k])[:3]
@@ -121,7 +121,7 @@ def check_delta(delta_path: str | Path, base_path: str | Path, expect: dict[str,
     squares, numel, peak = 0.0, 0, 0.0
     with guarded_safe_open(delta_path, "drafter") as handle:
         for name, shape in shapes.items():
-            keys = [name + suffix for suffix in dl.INT8_KEYS] if meta["delta_dtype"] == "int8" else [name]
+            keys = dl.delta_keys(name, meta["delta_dtype"], got)
             value = dl.decode_named({k: handle.get_tensor(k) for k in keys}, {name: shape}, meta["delta_dtype"])[name]
             if not bool(torch.isfinite(value).all()):
                 raise CheckFailed("non_finite", f"{name} has NaN or Inf")
@@ -200,7 +200,7 @@ def candidate_weights(base_path: str | Path, delta_path: str | Path, out_path: s
                                                                                "dtype": dtype, "candidate": True})})
     with guarded_safe_open(base_path, "drafter") as base, guarded_safe_open(delta_path, "drafter") as delta:
         for name, shape in shapes.items():
-            keys = [name + suffix for suffix in dl.INT8_KEYS] if meta["delta_dtype"] == "int8" else [name]
+            keys = dl.delta_keys(name, meta["delta_dtype"], set(delta.keys()))
             value = dl.decode_named({k: delta.get_tensor(k) for k in keys}, {name: shape}, meta["delta_dtype"])[name]
             writer.write(name, base.get_tensor(name).float() - value)
     return writer.close()

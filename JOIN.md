@@ -97,4 +97,6 @@ tokens stay credited. The operator's dashboard (`https://<host>/<path>/`) shows 
 | `self-check failed before upload` | nothing was uploaded; read the code (layout, non_finite, norm_high ...) and report it with the trainer log path it prints |
 | `training failed ... see <log>` | read the log; rerun to resume; out-of-memory: lower `--anchors` via `--trainer-arg` or stop other processes |
 | `no recipe shard is open` | the client waits and retries; or switch to bring-your-own mode |
+| `waiting (...)` | nothing to do: the finished delta is kept and the client continues by itself (for example it runs a canary first, then uploads the delta) |
+| `... The delta is kept at <work>/unmergeable/...` | the network changed in a way that makes that delta unusable; it is kept for inspection and the next round starts |
 | `coordinator unreachable` | network issue; the client retries with backoff; rerun later |

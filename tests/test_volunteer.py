@@ -260,6 +260,76 @@ class ClientTests(unittest.TestCase):
                 site._data(cycle)
             self.assertTrue(victim.is_dir())
 
+    def test_every_server_code_has_a_client_action_that_keeps_the_delta(self):   # re-review N1
+        import re
+
+        codes = set()
+        for path in ("coordinator/service.py", "coordinator/server.py", "coordinator/client.py",
+                     "coordinator/storage.py"):
+            codes |= set(re.findall(r'ApiError\(\w*?\d*, "(\w+)"', (REPO / path).read_text()))
+        codes |= {"rate_limited", "internal"}
+        self.assertGreater(len(codes), 25)
+        self.assertEqual(sorted(codes - set(join.UPLOAD_ACTIONS)), [])
+        with tempfile.TemporaryDirectory() as tmp:
+            opts = join.build_parser().parse_args(["run", "--work", tmp, "--config", str(TINY)])
+            site = join.Site(ApiClient("http://127.0.0.1:9", retries=0), "token", Path(tmp), opts)
+            for code in sorted(codes):
+                delta = Path(tmp) / "outbox" / f"{code}.safetensors"
+                delta.parent.mkdir(exist_ok=True)
+                delta.write_bytes(b"finished work")
+                cycle = {"client_id": f"cid{code}", "canary": False, "stage": "upload", "delta": str(delta),
+                         "delta_id": "d_1", "base": {"version": 0}}
+                site.state.update(cycle=cycle, parked=[])
+                error = site.upload_error(cycle, ApiError(409, code, "x"))
+                action = join.UPLOAD_ACTIONS[code][0]
+                kept = [p for p in Path(tmp).rglob(f"{code}.safetensors")]
+                self.assertEqual([p.read_bytes() for p in kept], [b"finished work"], code)   # never discarded
+                if action == "retry":
+                    self.assertGreater(error.wait, 0, code)   # backs off; the cycle is untouched
+                    self.assertIs(site.state["cycle"], cycle)
+                elif action == "park":
+                    self.assertEqual((site.state["cycle"], site.state["parked"]), (None, [cycle]))
+                    self.assertEqual(error.wait, 0)
+                elif action == "new_id":
+                    self.assertNotEqual(cycle["client_id"], f"cid{code}")   # a different request next time
+                elif action in ("aside", "aside_stop"):
+                    self.assertIsNone(site.state["cycle"])
+                    self.assertIn("unmergeable", str(kept[0]))
+                    self.assertEqual(error.wait, 0 if action == "aside" else None)
+                else:
+                    self.assertEqual((action, error.wait), ("stop", None))
+                    self.assertIs(site.state["cycle"], cycle)   # resumes once the user or operator acted
+
+    def test_parked_delta_is_uploaded_after_the_canary(self):   # re-review N1
+        with tempfile.TemporaryDirectory() as tmp:
+            opts = join.build_parser().parse_args(["run", "--work", tmp, "--config", str(TINY), "--mode", "byo",
+                                                   "--byo-features", tmp])
+            uploaded = []
+
+            class Fake:
+                token = "token"
+
+                def call(self, method, path, body=None, auth=True):
+                    if path == "/api/v1/requirements":
+                        return {**site.pins(), "version": 0, "canary_required": False, "open_deltas": 0,
+                                "max_open_deltas": 3, "terms_sha256": terms.TERMS_SHA256}
+                    if method == "POST" and path == "/api/v1/deltas":
+                        uploaded.append(body["client_id"])
+                        return {"delta_id": "d_parked", "state": "pending", "duplicate": False, "upload_id": "u"}
+                    return {"state": "pending"}
+
+            site = join.Site(Fake(), "token", Path(tmp), opts)
+            delta = Path(tmp) / "outbox" / "parked.safetensors"
+            delta.parent.mkdir()
+            delta.write_bytes(b"x")
+            cycle = {"client_id": "cid-parked", "canary": False, "stage": "upload", "delta": str(delta), "size": 1,
+                     "sha256": "0" * 64, "base": {"version": 0, "sha256": "1" * 64}, "meta": {"tokens": 5.0}}
+            site.state["cycle"] = cycle
+            site.upload_error(cycle, ApiError(409, "canary_required", "canary first"))
+            result = site.cycle()   # the canary has passed (canary_required is false): the parked delta goes up
+            self.assertEqual((result["delta_id"], uploaded), ("d_parked", ["cid-parked"]))
+            self.assertEqual(site.state["parked"], [])
+
     def test_int8_is_the_default_delta_format(self):
         from enntity_drafter import train
 
@@ -449,18 +519,31 @@ class FailureInjectionTests(unittest.TestCase):
         self.assertEqual(states[copy], ("quarantined", "near_duplicate"))
 
     def test_regressing_merge_is_refused_and_its_deltas_held(self):   # review 3
-        self.validator.state["best_metrics"] = {"heldout": 100.0}   # pretend a much better global was published
+        self.validator.state["best"] = {"version": 0, "metrics": {"heldout": 100.0}}   # a much better global
         ids = [self.upload(site) for site in self.sites]
         self.validator.step()
         self.assertEqual(self.current()[0], 0)
         self.assertEqual({self.states()[i] for i in ids}, {("held", "merge_regression")})
         self.assertIsNone(self.validator.state["pending_merge"])
-        self.validator.state["best_metrics"] = dict(self.validator.state["reference_metrics"])
-        for delta in ids:   # the operator reviews and releases them: nothing was discarded
-            self.net.admin_call("POST", f"/admin/deltas/{delta}/release", {"decision": "accept"})
+        self.assertEqual(len(self.net.admin_call("GET", "/admin/attention")["needs_review"]), 2)
+        for delta in ids:   # the gate still refuses: the operator releases them with an audited override
+            self.net.admin_call("POST", f"/admin/deltas/{delta}/release", {"decision": "accept", "publish": True})
         self.validator.step()
         self.assertEqual(self.current()[0], 1)
         self.assertEqual({self.states()[i][0] for i in ids}, {"merged"})
+        self.assertIn("merge.gate_overridden", [e["event"] for e in self.net.admin_call("GET", "/admin/audit")])
+        self.assertFalse(self.net.admin_call("GET", "/admin/attention")["force_merge_pending"])
+
+    def test_gate_compares_one_coherent_best_version_with_a_noise_margin(self):   # re-review N2
+        self.validator.state["best"] = {"version": 4, "metrics": {"a": 5.0, "b": 4.0}}
+        self.validator.state["reference_metrics"] = {"a": 1.0, "b": 1.0}
+        self.validator.state["noise"] = 0.0
+        # a per-group maximum over versions ({"a": 5.0, "b": 4.2}) would refuse this forever
+        self.assertIsNone(self.validator._gate({"a": 5.0, "b": 4.05}))
+        self.assertIsNotNone(self.validator._gate({"a": 4.8, "b": 4.05}))
+        self.validator.state["noise"] = 0.05   # measured eval noise widens the margin
+        self.assertIsNone(self.validator._gate({"a": 4.8, "b": 4.05}))
+        self.assertIn("noise", self.validator.state)
 
     def test_crash_between_merge_and_publish_is_deterministic(self):   # review 5
         self.validator.outer = {"lr": 1.0, "momentum": 0.9, "nesterov": True}
@@ -497,19 +580,44 @@ class FailureInjectionTests(unittest.TestCase):
             expected = master0[name] - (mean + 0.9 * mean)   # Nesterov, first step from zero momentum
             self.assertTrue(torch.allclose(master1[name], expected, atol=1e-6), name)
 
-    def test_validator_error_quarantines_one_delta_and_the_loop_continues(self):   # review 12
+    def test_validator_error_is_retried_and_the_loop_continues(self):   # review 12, re-review N3
         first = self.upload(self.sites[0])
         second = self.upload(self.sites[1])
-        self.toy.fail_on = {self.toy.calls + 1}   # a bug while evaluating the first delta
+        self.toy.fail_on = {self.toy.calls + 1}   # a transient failure while evaluating the first delta
         self.validator.min_deltas = 3
         self.validator.step()                        # no exception escapes
-        self.assertEqual(self.states()[first], ("quarantined", "validator_error"))
+        self.assertEqual(self.states()[first][0], "pending")   # retried with backoff, not the contributor's fault
+        self.assertEqual(self.sites[0].call("GET", f"/api/v1/deltas/{first}")["review"], "retry scheduled")
         self.assertEqual(self.states()[second][0], "accepted")
         self.assertEqual(self.received(self.sites[0])["tokens_received"], 1000.0)
-        fixed = self.make_validator("2")
-        fixed.min_deltas = 2
-        fixed.step()   # the version bump re-validates it
+        self.validator.min_deltas = 2
+        self.validator.step()
+        self.assertEqual(self.states()[first][0], "pending")   # its backoff has not passed
+        self.net.clock.t += 61
+        self.validator.step()
         self.assertEqual({self.states()[d][0] for d in (first, second)}, {"merged"})
+
+    def test_relased_shard_duplicate_merges_at_reduced_weight(self):   # re-review N4
+        self.net.admin_call("POST", "/admin/shards", {"recipes": [{"builder": "synthetic", "rows": [0, 8]}]})
+        version, sha, base = self.current()
+        honest = self.toy.honest(base, 0.2, 11)
+        first_lease = self.sites[0].call("POST", "/api/v1/shards/claim")["shard"]
+        self.net.clock.t += self.net.config.lease_s + self.net.config.lease_grace_s + 1   # the lease expires
+        second_lease = self.sites[1].call("POST", "/api/v1/shards/claim")["shard"]
+        self.assertEqual(first_lease["id"], second_lease["id"])
+        self.assertNotEqual(first_lease["lease_id"], second_lease["lease_id"])
+        ids = []
+        for i, (site, lease, scale) in enumerate(((self.sites[0], first_lease, 1.0),
+                                                  (self.sites[1], second_lease, 1.0005))):
+            path = write_delta(self.root / f"lease{i}.safetensors", {k: v * scale for k, v in honest.items()}, sha,
+                               PINS)
+            ids.append(send_delta(site, path, version, sha, f"lease-{i:04d}", mode="recipe", shard_id=lease["id"],
+                                  lease_id=lease["lease_id"])["delta_id"])
+        self.validator.min_deltas = 3
+        self.validator.step()
+        self.assertEqual(self.states()[ids[0]], ("accepted", None))
+        self.assertEqual(self.states()[ids[1]], ("accepted", "duplicate_lease"))
+        self.assertEqual(len(list((self.validator.workdir / "sketches").glob("*"))), 2)   # one stored sketch each
 
     def test_object_changed_after_acceptance_is_quarantined_at_merge(self):   # review 10
         self.validator.min_deltas = 3

@@ -35,7 +35,7 @@ SECURITY_HEADERS = {
 class RateLimiter:
     """Token buckets per (class, key), in memory only (no IPs are stored)."""
 
-    LIMITS = {"redeem": (5, 10 / 3600), "public": (120, 10.0), "site": (60, 2.0), "upload": (20, 20 / 60),
+    LIMITS = {"redeem": (20, 1 / 60), "public": (120, 10.0), "site": (60, 2.0), "upload": (20, 20 / 60),
               "heartbeat": (10, 1 / 20), "validator": (600, 50.0)}
 
     def __init__(self, clock: Callable[[], float] = time.monotonic):
@@ -119,6 +119,7 @@ class Handler(BaseHTTPRequestHandler):
         self.consumed = not length or length.strip() == "0"
         if self.headers.get("Transfer-Encoding"):   # chunked bodies are not supported: never guess their end
             self.consumed = False
+            return self._send(411, {"error": "length_required", "message": "send a Content-Length body"})
         try:
             self.app.handle(self)
         except ApiError as error:
@@ -153,7 +154,10 @@ class App:
                 ("POST", "/admin/settings/<id>", None, lambda h, b, m: s.set_setting(m["id"], b.get("value"))),
                 ("GET", "/admin/settings/<id>", None, lambda h, b, m: s.get_setting(m["id"])),
                 ("POST", "/admin/deltas/<id>/release", None,
-                 lambda h, b, m: s.release_held(m["id"], b.get("decision"), float(b.get("weight_factor", 1.0)))),
+                 lambda h, b, m: s.release_held(m["id"], b.get("decision"), float(b.get("weight_factor", 1.0)),
+                                                bool(b.get("publish")))),
+                ("GET", "/admin/deltas", None, lambda h, b, m: s.list_deltas(b.get("state"))),
+                ("GET", "/admin/attention", None, lambda h, b, m: s.attention()),
                 ("GET", "/admin/audit", None, lambda h, b, m: s.audit_log(int(b.get("limit", 200)))),
             ]
         else:

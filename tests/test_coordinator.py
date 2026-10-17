@@ -533,6 +533,67 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertIn(b"Connection: close", received)
         self.assertEqual(received.count(b"HTTP/1.1 "), 1)   # the body was never served as a second request
 
+    def test_chunked_bodies_are_refused_and_the_connection_closed(self):   # re-review: smuggling via TE
+        import socket
+
+        host, port = self.net.url.split("//")[1].split(":")
+        smuggled = b"GET /drafter/api/v1/terms HTTP/1.1\r\nHost: x\r\n\r\n"
+        request = (b"POST /drafter/api/v1/redeem HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+                   + f"{len(smuggled):x}".encode() + b"\r\n" + smuggled + b"\r\n0\r\n\r\n")
+        with socket.create_connection((host, int(port)), timeout=5) as conn:
+            conn.sendall(request)
+            received = b""
+            while chunk := conn.recv(65536):
+                received += chunk
+        self.assertIn(b"411", received.split(b"\r\n", 1)[0])
+        self.assertIn(b"Connection: close", received)
+        self.assertEqual(received.count(b"HTTP/1.1 "), 1)
+
+    def test_round_finished_before_a_validator_bump_is_accepted(self):   # re-review N1
+        self.net.service.config.require_canary = True
+        site = self.net.register("bump")
+        canary = send_delta(site, self.new_blob(), 0, self.v0, "bump-0001")
+        self.accept(canary["delta_id"])
+        self.val.call("POST", "/api/v1/validator/hello", {"version": "2"})   # pins move while the round trains
+        self.assertTrue(site.call("GET", "/api/v1/requirements")["canary_required"])
+        late = send_delta(site, self.new_blob(), 0, self.v0, "bump-0002", meta={"steps": 500, "validator_version": "1"})
+        self.assertEqual(late["state"], "pending")   # accepted and validated as usual; the canary runs next
+        self.assertFalse(site.call("GET", f"/api/v1/deltas/{late['delta_id']}")["canary"])
+
+    def test_admin_review_paths_retries_and_escalation(self):   # re-review N2, N3
+        site = self.net.register("rev")
+        delta = send_delta(site, self.new_blob(), 0, self.v0, "rev-00001")["delta_id"]
+        for attempt in range(1, self.net.config.max_validator_retries):   # validator errors retry with backoff
+            self.val.call("POST", f"/api/v1/validator/deltas/{delta}/claim")
+            self.val.call("POST", f"/api/v1/validator/deltas/{delta}/verdict",
+                          {"decision": "reject", "code": "validator_error", "validator_version": "1"})
+            status = site.call("GET", f"/api/v1/deltas/{delta}")
+            self.assertEqual((status["state"], status["review"]), ("pending", "retry scheduled"))
+            self.assertEqual(self.val.call("GET", "/api/v1/validator/pending"), [])   # not before its backoff
+            self.net.clock.t += 3601
+        self.val.call("POST", f"/api/v1/validator/deltas/{delta}/claim")
+        self.val.call("POST", f"/api/v1/validator/deltas/{delta}/verdict",
+                      {"decision": "reject", "code": "validator_error", "validator_version": "1"})
+        status = site.call("GET", f"/api/v1/deltas/{delta}")
+        self.assertEqual((status["state"], status["review"]), ("quarantined", "awaiting operator review"))
+        self.assertEqual([d["delta_id"] for d in self.net.admin_call("GET", "/admin/deltas?state=quarantined")],
+                         [delta])
+        self.net.clock.t += self.net.config.quarantine_retention_s + 1
+        report = self.net.service.maintenance()
+        self.assertEqual((report["purged"], report["escalated"]), (0, 1))   # unreviewed: kept, and escalated
+        attention = self.net.admin_call("GET", "/admin/attention")
+        self.assertEqual([r["id"] for r in attention["needs_review"]], [delta])
+        self.assertIn("delta.needs_review", [e["event"] for e in self.net.admin_call("GET", "/admin/audit")])
+        self.net.admin_call("POST", f"/admin/deltas/{delta}/release", {"decision": "revalidate"})
+        self.assertEqual([d["delta_id"] for d in self.val.call("GET", "/api/v1/validator/pending")], [delta])
+        self.val.call("POST", f"/api/v1/validator/deltas/{delta}/claim")
+        self.val.call("POST", f"/api/v1/validator/deltas/{delta}/verdict",
+                      {"decision": "reject", "code": "heldout_regression", "validator_version": "1"})
+        self.net.admin_call("POST", f"/admin/deltas/{delta}/release", {"decision": "reject"})   # reviewed
+        self.net.clock.t += self.net.config.quarantine_retention_s + 1
+        self.assertEqual(self.net.service.maintenance()["purged"], 1)
+        self.assertEqual(site.call("GET", f"/api/v1/deltas/{delta}")["review"], "reviewed by the operator")
+
     def test_plan_upload_runs_outside_the_write_lock(self):   # review LOW
         import sqlite3
 
@@ -563,11 +624,16 @@ class ReviewRegressionTests(unittest.TestCase):
             return 200
 
         self.net.app.trusted_proxies = {"127.0.0.1"}
-        self.assertEqual([redeem("9.9.9.9, 1.1.1.1") for _ in range(6)], [403] * 5 + [429])
+        self.assertEqual([redeem("9.9.9.9, 1.1.1.1") for _ in range(21)], [403] * 20 + [429])
         self.assertEqual(redeem("1.1.1.1, 2.2.2.2"), 403)   # the rightmost hop is the client: its own bucket
         self.net.app.trusted_proxies = set()
         self.net.app.limiter.buckets.clear()
-        self.assertEqual([redeem(f"10.0.0.{i}") for i in range(6)], [403] * 5 + [429])   # spoofed hops ignored
+        self.assertEqual([redeem(f"10.0.0.{i}") for i in range(21)], [403] * 20 + [429])   # spoofed hops ignored
+        from coordinator.__main__ import check_proxy_config
+
+        with self.assertRaises(SystemExit):   # proxy mode without the proxy's address refuses to start
+            check_proxy_config({"DRAFTER_PROXY_MODE": "1"})
+        check_proxy_config({"DRAFTER_PROXY_MODE": "1", "DRAFTER_TRUSTED_PROXIES": "172.18.0.2"})
 
     def test_admin_api_needs_token_and_loopback_host(self):   # review LOW
         with self.assertRaises(ApiError) as anonymous:
@@ -591,6 +657,9 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertEqual(bad.exception.status, 400)
         dockerfile = (_common.REPO / "coordinator" / "Dockerfile").read_text()
         self.assertRegex(dockerfile, r"(?m)^FROM python:[\w.-]+@sha256:[0-9a-f]{64}$")
+        pyproject = (_common.REPO / "pyproject.toml").read_text()
+        self.assertIn('"cryptography>=42,<47"', pyproject)   # same range as the image
+        self.assertIn('"cryptography>=42,<47"', dockerfile)
 
 
 class ControlPlaneTests(unittest.TestCase):

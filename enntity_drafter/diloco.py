@@ -35,7 +35,8 @@ Files (safetensors only, never pickle):
 
 * weights: one tensor per trainable parameter name (fp32 or bf16), header ``weights`` (JSON) + scratch stamp;
 * delta: ``encode_named``: fp32/bf16 tensors under the parameter name, or int8 ``<name>::q`` + fp32
-  ``<name>::scale``; header ``delta`` (JSON) + scratch stamp.
+  ``<name>::scale`` (blockwise absmax), with ``<name>::bf16`` instead for any tensor whose int8 error would exceed
+  ``INT8_MAX_REL_ERR`` (heavy-tailed tensors); header ``delta`` (JSON) + scratch stamp.
 """
 
 from __future__ import annotations
@@ -59,6 +60,8 @@ DELTA_DTYPES = ("fp32", "bf16", "int8")
 WEIGHT_DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16}
 INT8_BLOCK = 1024
 INT8_KEYS = ("::q", "::scale")
+INT8_FALLBACK = "::bf16"      # an int8 delta file stores a tensor in bf16 when int8 would lose too much of it
+INT8_MAX_REL_ERR = 0.01       # relative L2 error above which a tensor falls back to bf16 (heavy-tailed tensors)
 DELTA_SCHEMA = "enntity.drafter.delta/v1"
 WEIGHTS_SCHEMA = "enntity.drafter.weights/v1"
 #: Links the per-sync record prices the exchange on (bytes/s): a slow and a fast internet uplink.
@@ -114,20 +117,39 @@ def encode_named(deltas: dict[str, torch.Tensor], dtype: str) -> dict[str, torch
         raise ValueError(f"delta dtype {dtype!r}")
     out: dict[str, torch.Tensor] = {}
     for name, value in deltas.items():
-        payload = encode(value.detach().reshape(-1), dtype)
+        flat = value.detach().reshape(-1).float()
+        payload = encode(flat, dtype)
         if dtype == "int8":
-            out[name + INT8_KEYS[0]], out[name + INT8_KEYS[1]] = payload["q"], payload["scale"]
+            norm = float(flat.norm())
+            error = float((decode(payload, flat.numel()) - flat).norm()) / norm if norm else 0.0
+            if error > INT8_MAX_REL_ERR:
+                out[name + INT8_FALLBACK] = flat.to(torch.bfloat16)
+            else:
+                out[name + INT8_KEYS[0]], out[name + INT8_KEYS[1]] = payload["q"], payload["scale"]
         else:
             out[name] = payload["q"].view(value.shape)
     return out
 
 
-def delta_layout(shapes: dict[str, tuple[int, ...]], dtype: str) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
-    """Expected (dtype, shape) of every key of a delta file of these parameters."""
+def delta_keys(name: str, dtype: str, available) -> list[str]:
+    """The file keys holding parameter ``name`` (int8 files may store some tensors in bf16)."""
+
+    if dtype != "int8":
+        return [name]
+    return [name + INT8_FALLBACK] if name + INT8_FALLBACK in available else [name + k for k in INT8_KEYS]
+
+
+def delta_layout(shapes: dict[str, tuple[int, ...]], dtype: str, available=()) -> dict[str, tuple[torch.dtype,
+                                                                                               tuple[int, ...]]]:
+    """Expected (dtype, shape) of every key of a delta file of these parameters (``available``: the file's keys,
+    which say which int8 tensors fell back to bf16)."""
 
     if dtype == "int8":
         layout = {}
         for name, shape in shapes.items():
+            if name + INT8_FALLBACK in available:
+                layout[name + INT8_FALLBACK] = (torch.bfloat16, (math.prod(shape),))
+                continue
             blocks = -(-math.prod(shape) // INT8_BLOCK)
             layout[name + INT8_KEYS[0]] = (torch.int8, (blocks * INT8_BLOCK,))
             layout[name + INT8_KEYS[1]] = (torch.float32, (blocks,))
@@ -139,7 +161,7 @@ def decode_named(tensors: dict[str, torch.Tensor], shapes: dict[str, tuple[int, 
                  ) -> dict[str, torch.Tensor]:
     """fp32 deltas from a delta file's tensors; ``ValueError`` on any missing, extra or mis-typed key."""
 
-    layout = delta_layout(shapes, dtype)
+    layout = delta_layout(shapes, dtype, tensors)
     if set(tensors) != set(layout):
         missing, extra = sorted(set(layout) - set(tensors)), sorted(set(tensors) - set(layout))
         raise ValueError(f"delta keys differ from the model (missing {missing[:3]}, extra {extra[:3]})")
@@ -149,7 +171,9 @@ def decode_named(tensors: dict[str, torch.Tensor], shapes: dict[str, tuple[int, 
                              f"!= {want_dtype} {want_shape}")
     out = {}
     for name, shape in shapes.items():
-        if dtype == "int8":
+        if dtype == "int8" and name + INT8_FALLBACK in tensors:
+            out[name] = tensors[name + INT8_FALLBACK].float().view(shape)
+        elif dtype == "int8":
             payload = {"q": tensors[name + INT8_KEYS[0]], "scale": tensors[name + INT8_KEYS[1]]}
             out[name] = decode(payload, math.prod(shape)).view(shape)
         else:
