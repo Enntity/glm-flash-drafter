@@ -126,31 +126,23 @@ More: [docs/pipeline.md](docs/pipeline.md), [docs/capture.md](docs/capture.md)
 
 ## How to help
 
-Ready now:
+- **Run a volunteer training site** (built, not yet hosted). Sites train the whole drafter on their own data
+  for short rounds and upload only weight deltas; a validator checks each delta on a private held-out set and
+  merges accepted ones by token-weighted plain averaging (DiLoCo with outer learning rate 1, which matched or
+  beat synchronous training in a two-site A/B). Joining is by invite: with a link from the operator, follow
+  [JOIN.md](JOIN.md) (written so a coding agent can execute it). Design, costs per round, trust model and what
+  we promise contributors: [docs/volunteer.md](docs/volunteer.md); running the coordinator and validator:
+  [docs/operators.md](docs/operators.md).
+- **Generate data.** Run the prompt builders and `api_generate.py` with your own key. Better, more diverse prompt
+  builders (especially prose, where the drafter is weakest) are the most useful code contribution today.
+- **Run capture and training locally**, on one or two GB10-class machines with your own GLM-5.3-Flash copy. The
+  CPU tests exercise the full trainer, the coordinator and the validator on a tiny model with no GPU.
+- **Reproduce results.** The Atlas check and the trainer's held-out evals are scripted. Rounds 1-2b also used
+  Enntity-internal agentic and chat traffic, which is not published, so those exact runs cannot be repeated from
+  this repo alone; runs on the public builders can, and we will publish theirs.
 
-- **Generate data.** Run the prompt builders and `api_generate.py` with your
-  own key. Better, more diverse prompt builders (especially prose, where the
-  drafter is weakest) are the most useful contribution today.
-- **Run capture and training locally**, on one or two GB10-class machines with
-  your own GLM-5.3-Flash copy. The CPU tests exercise the full trainer on a
-  tiny model with no GPU.
-- **Reproduce results.** The Atlas check and the trainer's held-out evals are
-  scripted. Rounds 1-2b also used Enntity-internal agentic and chat traffic,
-  which is not published, so those exact runs cannot be repeated from this
-  repo alone; runs on the public builders can, and we will publish theirs.
-
-Planned, not built:
-
-- **Training across volunteer sites** with DiLoCo-style low-communication
-  updates (each site trains on its own captured shards; sites exchange model
-  deltas every few hundred steps). The sync coordinator does not exist yet.
-- **Validation of contributions.** Any shared data or update can be wrong or
-  malicious. Nothing contributed will be merged without checks such as
-  recapturing a sample of rows on a trusted node, held-out evaluation of each
-  update, and rejecting outliers. The design is open; see
-  [docs/roadmap.md](docs/roadmap.md).
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
+No data is ever uploaded to the network: recipe sites generate Enntity shard recipes locally, and
+bring-your-own-data sites keep their data. See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
 
 ## Quick start (CPU tests)
 
@@ -163,4 +155,5 @@ OMP_NUM_THREADS=1 python -m unittest discover -s tests -v
 ```
 
 The suite trains tiny models with 1-2 CPU processes (gloo) and takes tens of
-minutes; run one file with `-p test_train.py`.
+minutes; run one file with `-p test_train.py`. The volunteer-training tests are
+`tests/test_diloco.py`, `tests/test_coordinator.py` and `tests/test_volunteer.py`.

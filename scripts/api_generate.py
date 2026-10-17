@@ -25,7 +25,10 @@ worst-case reserve for in-flight requests, cross-checked against the key's
 usage counter).  Every reply is recorded; ``junk`` marks rows to drop (errors,
 host error text returned as content, empty answers).
 
-Key: ``OPENROUTER_API_KEY`` from the environment; never printed or written.
+Key: ``OPENROUTER_API_KEY`` (or ``--key-env``) from the environment; never printed or written.  ``--url`` and
+``--model`` point at another OpenAI-compatible GLM-5.3-Flash endpoint (for example your own server); the
+OpenRouter-only fields (provider routing, usage accounting, reasoning switch, key usage check) are then not sent
+and thinking is left at the server's default.
 Output: ``<out>/generations.jsonl`` and ``<out>/gen-summary.json``.
 
     python scripts/api_generate.py --prompts data/prompts/templates/train.jsonl --out data/gen/templates \
@@ -46,7 +49,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_URL = URL = "https://openrouter.ai/api/v1/chat/completions"
 KEY_URL = "https://openrouter.ai/api/v1/key"
 MODEL = "z-ai/glm-5.3-flash"
 #: Z.AI: excluded by its terms (above).  AtlasCloud: returned quota-error text as content in a probe.
@@ -72,9 +75,10 @@ def api_messages(msgs):
 
 def body_for(row, max_tokens):
     b = {"model": MODEL, "messages": api_messages(row["messages"]), "max_tokens": max_tokens,
-         "temperature": row.get("temperature", 1.0), "top_p": 0.95,
-         "usage": {"include": True}, "provider": {**PROVIDER, **(row.get("provider_extra") or {})},
-         "reasoning": {"effort": row["reasoning_effort"]} if row.get("reasoning_effort") else {"enabled": True}}
+         "temperature": row.get("temperature", 1.0), "top_p": 0.95}
+    if URL == OPENROUTER_URL:
+        b.update(usage={"include": True}, provider={**PROVIDER, **(row.get("provider_extra") or {})},
+                 reasoning={"effort": row["reasoning_effort"]} if row.get("reasoning_effort") else {"enabled": True})
     if row.get("tools"):
         b["tools"] = row["tools"]
     for k in ("tool_choice", "response_format"):
@@ -84,13 +88,17 @@ def body_for(row, max_tokens):
 
 
 def post(body, key, timeout):
-    req = urllib.request.Request(URL, data=json.dumps(body).encode(), headers={
-        "Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    req = urllib.request.Request(URL, data=json.dumps(body).encode(), headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.load(resp)
 
 
 def key_usage(key):
+    if URL != OPENROUTER_URL:
+        return None
     try:
         req = urllib.request.Request(KEY_URL, headers={"Authorization": f"Bearer {key}"})
         with urllib.request.urlopen(req, timeout=30) as r:
@@ -160,13 +168,17 @@ def main():
                     help="stop issuing once good completion tokens reach this (e.g. 20e6)")
     ap.add_argument("--effort", default="",
                     help="effort for rows that carry none, per source, e.g. template=high")
+    ap.add_argument("--url", default=OPENROUTER_URL, help="OpenAI-compatible chat completions URL")
+    ap.add_argument("--model", default=MODEL, help="model name at --url")
+    ap.add_argument("--key-env", default="OPENROUTER_API_KEY", help="environment variable holding the API key")
     a = ap.parse_args()
-    global ALLOWED_SOURCES
+    global ALLOWED_SOURCES, URL, MODEL
     ALLOWED_SOURCES = set(a.sources.split(","))
+    URL, MODEL = a.url, a.model
     effort = dict(kv.split("=", 1) for kv in a.effort.split(",") if kv)
-    key = os.environ.get("OPENROUTER_API_KEY")
-    if not key:
-        raise SystemExit("OPENROUTER_API_KEY not set")
+    key = os.environ.get(a.key_env)
+    if not key and URL == OPENROUTER_URL:
+        raise SystemExit(f"{a.key_env} not set")
     rows = [json.loads(l) for l in open(a.prompts)]
     rows = [r for r in rows if r["source"] in ALLOWED_SOURCES and r["split"] == "train"]
     for r in rows:
@@ -195,7 +207,7 @@ def main():
             rec = {"id": f"{row['id']}#s{sample}", "prompt_id": row["id"], "sample": sample, "seq": seq,
                    "source": row["source"], "category": row["category"], "attempt": attempt,
                    "issued_at": round(ts - t0, 2), "temperature": body["temperature"], "top_p": body["top_p"],
-                   "reasoning_param": body["reasoning"], "max_tokens": a.max_tokens}
+                   "reasoning_param": body.get("reasoning"), "max_tokens": a.max_tokens}
             try:
                 d = post(body, key, a.timeout)
                 if not d.get("choices"):

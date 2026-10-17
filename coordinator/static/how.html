@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How Volunteer Training Works</title>
+<meta name="description" content="How sites train the open GLM-5.3-Flash drafter together, and how every update is validated.">
+<link rel="stylesheet" href="static/style.css">
+</head>
+<body data-page="how">
+<header>
+  <h1>How it works and how we validate</h1>
+  <nav><a href="./">Dashboard</a><a href="join">Join</a></nav>
+</header>
+<main>
+<article>
+  <h2>What this network trains</h2>
+  <p>A speculative-decoding drafter for GLM-5.3-Flash, trained from a fresh initialization and released under
+  Apache-2.0. Every site trains a full copy of the drafter on its own data for a short round (about 30 minutes of
+  training), then uploads only the difference between its weights and the global weights it started from (a
+  <em>delta</em>). A validator averages accepted deltas, weighted by tokens trained, into the next global version
+  (plain averaging; the method is DiLoCo with outer learning rate 1 and no outer momentum).</p>
+
+  <h2>What leaves a site, and what does not</h2>
+  <ul>
+    <li>Uploaded: weight deltas (safetensors tensors only, never code or pickles) and their metadata: mode, recipe
+    id or an opaque tag, token and step counts, trainer version, base hash, and a signed data-source attestation.</li>
+    <li>Heartbeats: phase, counters, throughput, GPU power. No hostnames, file paths or free text.</li>
+    <li>Never uploaded: prompts, completions, activations, or any file from the site. In bring-your-own-data mode
+    the site's data never leaves it.</li>
+  </ul>
+
+  <h2>How every delta is validated</h2>
+  <ol>
+    <li>Before training, the site's client compares its trainer, config and validator versions with the
+    network's pins. At upload initiation, before any bytes move, the coordinator checks the trainer and config
+    versions again, that the base is a retained global it published, size caps and the attestation
+    signature.</li>
+    <li>On the site, before upload: the same checks the validator runs (layout, finite values, size bounds, base
+    hash) and a small public check set. A delta that fails locally is never uploaded.</li>
+    <li>On the validator: SHA-256 of the stored file, the same checks again, an optional replay of recipe shards,
+    then a held-out evaluation of the site's trained weights against the base on a private, rotating held-out set
+    that is not in the repository or on this server.</li>
+    <li>Conservative verdicts: a delta is accepted unless a held-out group gets worse. A small drop is borderline
+    (merged at half weight or held for the operator); only a clear regression is rejected.</li>
+    <li>Rejected deltas are quarantined, not deleted, with a machine-readable and a human reason shown to the site.
+    When the validator is fixed, its version changes and every quarantined delta is validated again.</li>
+  </ol>
+
+  <h2>What we promise contributors</h2>
+  <ul>
+    <li>A short canary run is validated end to end before a site starts long rounds, and again after any version
+    change.</li>
+    <li>Version mismatches are refused at upload initiation, never after the upload.</li>
+    <li>Deltas against older globals are accepted with lower weight while their base is retained, and every base a
+    live site is training from is retained.</li>
+    <li>Work counts on receipt: the dashboard credits tokens as soon as a delta arrives, whatever validation later
+    decides.</li>
+    <li>Uploads resume after interruption; a site keeps its delta until the coordinator has it and has given a
+    verdict.</li>
+  </ul>
+
+  <h2>Trust and security</h2>
+  <ul>
+    <li>Joining is by one-use invite. The invite code travels in the link's fragment, which browsers never send to
+    servers. Site tokens are stored only as hashes.</li>
+    <li>Administrative actions are available only on the server's loopback interface and are recorded in an audit
+    log (registrations, invite use, accepts and rejects, revocations).</li>
+    <li>Weights and deltas move directly between sites and object storage through short-lived signed URLs.</li>
+    <li>A drafter cannot change GLM-5.3-Flash's output under greedy verification; a bad drafter can only make
+    decoding slower, which the held-out checks are there to catch.</li>
+  </ul>
+  <p>Source code, design and limits: the project's repository (docs/volunteer.md).</p>
+</article>
+</main>
+<footer>No trackers, no third-party requests.</footer>
+</body>
+</html>

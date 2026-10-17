@@ -26,9 +26,17 @@ tokenize = ["tokenizers", "jinja2"]
 # structured-coverage validators (enntity_drafter.prompts.validate, used by scripts/prepare_items.py)
 validate = ["pyyaml"]
 test = ["pytest"]
+# coordinator object storage on Google Cloud Storage (V4 signed URLs with a service-account key)
+gcs = ["cryptography"]
+
+[project.scripts]
+drafter-join = "enntity_drafter.join:main"
 
 [tool.setuptools]
-packages = ["enntity_drafter", "enntity_drafter.prompts"]
+packages = ["enntity_drafter", "enntity_drafter.prompts", "coordinator", "validator"]
+
+[tool.setuptools.package-data]
+coordinator = ["static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

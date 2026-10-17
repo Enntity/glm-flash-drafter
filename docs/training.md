@@ -113,6 +113,24 @@ stops every rank cleanly when host MemAvailable falls below it;
 `--time-budget-h` plans the step count from smoke-step timings
 (`--smoke-steps`).
 
+## DiLoCo weight sync (`--sync-mode diloco`, `enntity_drafter.diloco`)
+
+Workers take `--inner-steps` H independent AdamW steps (own optimizer state, no gradient all-reduce between
+workers), then exchange `delta = global - local` and apply an outer step on the average. Defaults: plain
+averaging (`--outer-lr 1 --outer-momentum 0`), bf16 deltas (`--delta-dtype fp32|bf16|int8`, int8 = absmax scale per
+1,024 values). The global weights are bitwise identical on every worker, evaluations see them, and checkpoints
+resume exactly, mid-round included.
+
+| `--diloco-transport` | workers | |
+|---|---|---|
+| `group` | the ranks of this torchrun world (`all_gather`) | |
+| `dir` | sites, each its own torchrun world, exchanging through `--diloco-dir` (`--sites N --site K`) | every site must use the same `--steps` |
+| `external` | one round per run from `--start-weights`, delta written to `--delta-out`; a coordinator merges | used by `drafter-join` (docs/volunteer.md) |
+
+`--start-weights FILE` starts the body from a weights file (the coordinator's global weights format,
+scratch-stamped); `--eval-only` evaluates it on the held-out set and exits (the validator's eval).
+`--eval-every 0` disables evaluation. With the full model a bf16 delta is 2.34 GB per site per sync.
+
 ## Performance (`enntity_drafter.fastpath`, every piece opt-in)
 
 Ceiling: 95 TFLOPS dense BF16 matmul per GB10. MFU = analytic matmul FLOPs of

@@ -1,0 +1,47 @@
+# Volunteer-training coordinator.  Generic example: put a TLS reverse proxy in front and keep host-specific wiring
+# (proxy labels, networks, paths) in your own deployment repository.  See docs/operators.md.
+#
+#   cd coordinator && DRAFTER_PUBLIC_URL=https://example.org/drafter docker compose up -d --build
+#   docker compose exec coordinator python -m coordinator invite --label "first site"
+#
+# Credentials are mounted as secret files and never passed as variables or arguments.  Point the *_PATH variables
+# at your files; unused backends default to /dev/null.
+services:
+  coordinator:
+    build:
+      context: ..
+      dockerfile: coordinator/Dockerfile
+    image: drafter-coordinator:local
+    restart: unless-stopped
+    environment:
+      DRAFTER_PUBLIC_URL: ${DRAFTER_PUBLIC_URL:?set DRAFTER_PUBLIC_URL, e.g. https://example.org/drafter}
+      DRAFTER_BASE_PATH: ${DRAFTER_BASE_PATH:-/drafter}
+      DRAFTER_TRUST_PROXY: "1"
+      DRAFTER_STORAGE: ${DRAFTER_STORAGE:-local}
+      DRAFTER_BUCKET: ${DRAFTER_BUCKET:-}
+      DRAFTER_S3_ENDPOINT: ${DRAFTER_S3_ENDPOINT:-}
+      DRAFTER_S3_REGION: ${DRAFTER_S3_REGION:-fsn1}
+      DRAFTER_S3_ACCESS_KEY_FILE: /run/secrets/s3_access_key
+      DRAFTER_S3_SECRET_KEY_FILE: /run/secrets/s3_secret_key
+      DRAFTER_GCS_CREDENTIALS_FILE: /run/secrets/gcs_credentials
+    secrets: [s3_access_key, s3_secret_key, gcs_credentials]
+    volumes:
+      - coordinator-data:/data          # SQLite (WAL) state; back it up
+    ports:
+      - "127.0.0.1:8080:8080"           # the proxy connects here; the admin port (8081) is never published
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 512m
+
+secrets:
+  s3_access_key:
+    file: ${DRAFTER_S3_ACCESS_KEY_PATH:-/dev/null}
+  s3_secret_key:
+    file: ${DRAFTER_S3_SECRET_KEY_PATH:-/dev/null}
+  gcs_credentials:
+    file: ${DRAFTER_GCS_CREDENTIALS_PATH:-/dev/null}
+
+volumes:
+  coordinator-data:

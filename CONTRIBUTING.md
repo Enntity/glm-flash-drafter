@@ -25,11 +25,10 @@ license, so the rules on data and weights are strict.
   the hardware and the raw output. Report losing cells as well as winning ones,
   and give run-to-run spread when you have it.
 
-## Contributing data or compute
+## Contributing compute
 
-Shared data and training updates are not accepted yet: the checks they need
-(see docs/roadmap.md) are not built. If you want to help with that, open an
-issue to discuss the design first.
+Volunteer training sites contribute compute, not data: only weight deltas and counters are uploaded. Joining is by
+invite; see [JOIN.md](JOIN.md) and [docs/volunteer.md](docs/volunteer.md). Shared datasets are not accepted.
 
 ## Style
 

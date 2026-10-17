@@ -39,45 +39,33 @@ is also the unit a volunteer site would run.
 
 ## 4. Low-communication training across sites (DiLoCo-style)
 
-Goal: let several sites with GB10-class machines train one drafter without a
-fast interconnect between them.
+**done** (code and CPU tests; not deployed): the trainer's `--sync-mode diloco` (process group, shared directory,
+or `external` rounds for volunteer sites), the coordinator (`coordinator/`), the validator and merger
+(`validator/`) and the site client (`drafter-join`, `enntity_drafter/join.py`). Plain averaging (outer learning
+rate 1, no momentum) is the default: in a two-site, three-sync A/B on the full model it matched or beat
+synchronous training on held-out groups, while the OpenDiLoCo momentum setting fell well behind. Details:
+[volunteer.md](volunteer.md).
 
-- Each site runs the appliance on its own shards: H inner steps of AdamW on
-  its replica (the trainer already does replicated data-parallel training
-  within a site).
-- Every H steps, sites send the difference between their weights and the last
-  global weights (the outer gradient) to a coordinator, which averages them and
-  applies an outer optimizer (Nesterov momentum in DiLoCo), then broadcasts the
-  new global weights. Streaming DiLoCo's variant syncs parameter fragments on
-  a staggered schedule and overlaps communication with compute.
-- A full-precision delta is 4.7 GB (1.17B fp32); bf16 or lower-precision
-  deltas and fragment-wise sync reduce it. At H = 500 steps of ~3 s, one sync
-  every ~25 minutes.
-- **Not built:** the coordinator, the site client, delta compression, and
-  handling sites that join, leave or lag. A local single-site prototype of the
-  outer loop is the first step.
+Next:
+
+- A hosted coordinator and validator, then a pilot with invited sites.
+- A full-size run across two real sites (the recipe pipeline in `drafter-join` and `setup`'s hardware checks are
+  untested on GB10 so far).
+- int8 deltas (1.18 GB instead of 2.34 GB, 0.79% error on a real delta) and overlapped fragment syncs
+  (Streaming DiLoCo).
 
 ## 5. Validating contributions
 
-Anyone can send wrong or malicious data or updates (poisoned captures, deltas
-that degrade or backdoor the drafter). A drafter cannot change the target's
-output under greedy verification, but a bad drafter can make serving slower,
-and a backdoored one could behave differently on chosen inputs. Planned checks,
-none built yet:
+**done** for weight deltas: pins checked before any bytes move; the same delta checks on the site and on the
+validator (`enntity_drafter/validation.py`); held-out evaluation of every delta on a private, rotating held-out
+set with conservative thresholds; quarantine with automatic re-validation when the validator changes; spot-check
+replay of recipe shards (hook built; real recipes need operator-side capture); per-delta provenance (site, mode,
+recipe or tag, attestation) recorded with each merge. No data is uploaded, so there are no data contributions to
+validate.
 
-- **Data:** contributors share prompts and generations, not features; a
-  trusted node recaptures them, or recaptures a random sample and compares
-  bit-for-bit (the capture is deterministic without the prefix cache).
-  Builders and their outputs are reviewed like code.
-- **Updates:** every outer gradient is evaluated on a held-out set the
-  contributor does not see before it is merged; robust aggregation (for
-  example coordinate-wise median or trimmed mean instead of the mean) limits
-  any one site's weight; outliers and sites whose updates repeatedly hurt the
-  held-out proxy are excluded.
-- **Provenance:** every checkpoint already carries a stamped lineage
-  (`enntity_drafter.guard`); contributed updates would be recorded in it.
-- **Release:** a release candidate is checked in Atlas for exactness and
-  tok/step against the previous one before it is published.
+Planned: robust aggregation (coordinate-wise median or trimmed mean) once there are many sites; attributing
+held-out regressions in a merge back to its deltas; a release candidate is checked in Atlas for exactness and
+tok/step against the previous one before it is published.
 
 ## 6. Weights
 

@@ -211,7 +211,8 @@ class GuardTests(unittest.TestCase):
     def test_no_unguarded_tensor_loads_in_trainer_sources(self):
         pattern = re.compile(r"\b(load_file|safe_open|torch\.load)\(")
         offenders = []
-        for path in sorted((REPO / "enntity_drafter").glob("*.py")) + sorted((REPO / "scripts").glob("*.py")):
+        for path in sorted(p for d in ("enntity_drafter", "scripts", "coordinator", "validator")
+                           for p in (REPO / d).glob("*.py")):
             if path.name == "guard.py":
                 continue
             for number, line in enumerate(path.read_text().splitlines(), 1):

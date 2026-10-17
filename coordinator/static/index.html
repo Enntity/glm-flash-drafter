@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Drafter Volunteer Network</title>
+<meta name="description" content="Live status of volunteer training for the open GLM-5.3-Flash drafter.">
+<link rel="stylesheet" href="static/style.css">
+<script src="static/app.js" defer></script>
+</head>
+<body data-page="dashboard">
+<header>
+  <h1>GLM-5.3-Flash drafter: volunteer training</h1>
+  <nav><a href="how">How it works and how we validate</a><a href="join">Join</a></nav>
+</header>
+<main>
+  <p class="sub" id="sub">Loading live data...</p>
+  <div class="tiles">
+    <div class="tile"><div class="label">Global model</div><div class="value" id="t-version">-</div></div>
+    <div class="tile"><div class="label">Sites online</div><div class="value" id="t-online">-</div></div>
+    <div class="tile"><div class="label">Tokens trained / day</div><div class="value" id="t-day">-</div></div>
+    <div class="tile"><div class="label">Tokens received (all time)</div><div class="value" id="t-total">-</div></div>
+    <div class="tile"><div class="label">Deltas accepted / received</div><div class="value" id="t-deltas">-</div></div>
+    <div class="tile"><div class="label">GPU-hours / day</div><div class="value" id="t-gpu">-</div></div>
+  </div>
+  <section>
+    <h2>Held-out score per round (expected accepted tokens per block, higher is better)</h2>
+    <div id="curve"><p class="empty">No rounds yet.</p></div>
+  </section>
+  <section>
+    <h2>Sites</h2>
+    <div id="sites"><p class="empty">No sites yet.</p></div>
+  </section>
+  <div class="grid2">
+    <section>
+      <h2>Wanted: where the drafter is weakest</h2>
+      <div id="wanted"><p class="empty">Nothing published yet.</p></div>
+    </section>
+    <section>
+      <h2>Why deltas were held or quarantined</h2>
+      <div id="rejections"><p class="empty">None.</p></div>
+    </section>
+  </div>
+  <section>
+    <h2>Atlas benchmark (published by the operator)</h2>
+    <div id="bench"><p class="empty">Not published yet.</p></div>
+  </section>
+</main>
+<footer id="foot">Data from this coordinator's public API. No trackers, no third-party requests.</footer>
+</body>
+</html>

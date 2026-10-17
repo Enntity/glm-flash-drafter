@@ -21,7 +21,11 @@ the metric totals.
 * rank-local resume (params + optimizer state + step); deterministic per-step
   row and anchor schedule so a resumed run replays the same stream;
 * CPU/gloo and CUDA/NCCL; ``torchrun --nproc_per_node=2`` locally or
-  ``--nnodes=2`` across nodes; single process also works.
+  ``--nnodes=2`` across nodes; single process also works;
+* ``--sync-mode diloco`` (:mod:`.diloco`): workers take H independent inner
+  steps and exchange only weights, over the process group, a shared directory,
+  or (``--diloco-transport external``) a volunteer coordinator that validates
+  and merges every site's delta (docs/volunteer.md).
 
 See docs/training.md.  CPU tests: ``python -m pytest tests``.
 """
@@ -50,10 +54,11 @@ import torch.distributed as dist
 from torch import nn
 
 from . import capture_io as cd
+from . import diloco as dl
 from . import fastpath as fp
 from .data import RowStore, eligible_anchors
 from .export import export_engine_checkpoint, verify_export
-from .guard import guarded_torch_load, scratch_stamp
+from .guard import guarded_torch_load, scratch_stamp, sha256_file
 from .model import install_fixed_anchor_mask
 from .objectives import OBJECTIVES, loss_kwargs, training_loss
 
@@ -549,9 +554,11 @@ def _optimizer_to_cpu(optimizer: torch.optim.Optimizer) -> dict[str, Any]:
 def save_checkpoint(output: Path, step: int, model: nn.Module, optimizer: torch.optim.Optimizer,
                     rank: int, world: int, provenance: dict[str, Any],
                     counters: dict[str, float] | None = None,
-                    named: list[tuple[str, torch.Tensor]] | None = None, keep: int = 0) -> Path:
+                    named: list[tuple[str, torch.Tensor]] | None = None, keep: int = 0,
+                    extra: dict[str, Any] | None = None) -> Path:
     """``named``: the fp32 tensors the optimizer owns (default: the model's trainable parameters).
-    ``keep``: afterwards delete all but the ``keep`` newest ``step-*`` directories on this host."""
+    ``keep``: afterwards delete all but the ``keep`` newest ``step-*`` directories on this host.
+    ``extra``: more payload entries (``diloco``: global weights, outer momentum, round)."""
 
     directory = output / "checkpoints" / f"step-{step:07d}"
     if rank == 0:
@@ -568,7 +575,7 @@ def save_checkpoint(output: Path, step: int, model: nn.Module, optimizer: torch.
     payload = {
         "step": step, "rank": rank, "world": world, "counters": dict(counters or {}),
         "params": {n: p.detach().cpu().clone() for n, p in (named or trainable(model))},
-        "optimizer": _optimizer_to_cpu(optimizer),
+        "optimizer": _optimizer_to_cpu(optimizer), **(extra or {}),
     }
     temporary = directory / f"rank{rank}.pt.tmp"
     torch.save(payload, temporary)
@@ -585,8 +592,10 @@ def save_checkpoint(output: Path, step: int, model: nn.Module, optimizer: torch.
 
 @torch.no_grad()
 def load_checkpoint(output: Path, model: nn.Module, optimizer: torch.optim.Optimizer,
-                    rank: int, world: int,
-                    named: list[tuple[str, torch.Tensor]] | None = None) -> tuple[int, dict[str, float]]:
+                    rank: int, world: int, named: list[tuple[str, torch.Tensor]] | None = None,
+                    extras: dict[str, Any] | None = None) -> tuple[int, dict[str, float]]:
+    """``extras`` (optional) receives the checkpoint's ``diloco`` entry (None for a synchronous run)."""
+
     pointer = output / "checkpoints" / f"latest-rank{rank}"
     if not pointer.is_file():
         return 0, {}
@@ -603,6 +612,8 @@ def load_checkpoint(output: Path, model: nn.Module, optimizer: torch.optim.Optim
             raise RuntimeError(f"resume shape mismatch for {name}")
         target.copy_(value.to(target.device, target.dtype))
     optimizer.load_state_dict(payload["optimizer"])
+    if extras is not None:
+        extras["diloco"] = payload.get("diloco")
     return int(payload["step"]), dict(payload.get("counters", {}))
 
 
@@ -612,7 +623,8 @@ def init_from_checkpoint(directory: Path, model: nn.Module, rank: int, config_di
 
     The checkpoint must carry this trainer's scratch stamp (``guarded_torch_load`` refuses anything else,
     including warm-started lineages) and the same config digest.  The rank's own file is used when present
-    (replicas are identical), else any ``rank*.pt``.  Optimizer state and step are not taken.
+    (replicas are identical), else any ``rank*.pt``; of a DiLoCo checkpoint, its global weights.  Optimizer
+    state and step are not taken.
     Returns the parent record stamped into this run's provenance.
     """
 
@@ -628,10 +640,11 @@ def init_from_checkpoint(directory: Path, model: nn.Module, rank: int, config_di
     stamp = json.loads(stamp_bytes)
     if stamp.get("config_sha256") != config_digest:
         raise RuntimeError(f"--init-from {directory}: config digest {stamp.get('config_sha256')} != {config_digest}")
+    params = (payload.get("diloco") or {}).get("global") or payload["params"]
     named = dict(trainable(model))
-    if set(named) != set(payload["params"]):
+    if set(named) != set(params):
         raise RuntimeError(f"--init-from {directory}: parameter set differs from the model")
-    for name, value in payload["params"].items():
+    for name, value in params.items():
         target = named[name]
         if target.shape != value.shape:
             raise RuntimeError(f"--init-from shape mismatch for {name}")
@@ -641,6 +654,22 @@ def init_from_checkpoint(directory: Path, model: nn.Module, rank: int, config_di
             "provenance_sha256": hashlib.sha256(stamp_bytes).hexdigest(),
             "init_digest": stamp.get("init_digest"), "init_seed": stamp.get("init_seed"),
             "parent": stamp.get("parent")}
+
+
+@torch.no_grad()
+def load_start_weights(path: Path, named: list[tuple[str, torch.Tensor]]) -> dict[str, Any]:
+    """Copy a weights file (:func:`.diloco.load_weights`, guarded) into ``named``; returns its record."""
+
+    tensors, meta = dl.load_weights(path)
+    targets = dict(named)
+    if set(targets) != set(tensors):
+        raise RuntimeError(f"--start-weights {path}: parameter set differs from the model")
+    for name, value in tensors.items():
+        if targets[name].shape != value.shape:
+            raise RuntimeError(f"--start-weights shape mismatch for {name}")
+        targets[name].copy_(value.to(targets[name].device, targets[name].dtype))
+    return {"path": str(path), "sha256": sha256_file(path),
+            **{k: meta[k] for k in ("version", "dtype", "schema") if k in meta}}
 
 
 # --------------------------------------------------------------------------
@@ -785,6 +814,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--init-from", type=Path, default=None,
                    help="initialize the body from this trainer's own checkpoint directory (checkpoints/step-N: fp32 "
                         "masters of rank*.pt, stamped PROVENANCE.json, same config); fresh optimizer and schedule")
+    p.add_argument("--start-weights", type=Path, default=None,
+                   help="initialize the body from a weights file (enntity.drafter.weights/v1 safetensors, e.g. a "
+                        "coordinator's global weights; scratch stamp required); with --diloco-transport external "
+                        "every round starts from it")
+    p.add_argument("--eval-only", action="store_true",
+                   help="evaluate the initial body (--start-weights / --init-from) on the held-out set and exit")
     p.add_argument("--agreement-mask", default="off",
                    help="capture: drop supervised slots by decode-vs-prefill agreement: off | argmax | minprob:<p>")
     p.add_argument("--output", type=Path, required=True)
@@ -817,6 +852,34 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                            "to --output and exit (no evals, checkpoints or export)")
     perf.add_argument("--perf-warmup", type=int, default=3)
     perf.add_argument("--cpu-autocast", action="store_true", help=argparse.SUPPRESS)
+    lo = p.add_argument_group("DiLoCo weight sync (diloco.py, docs/volunteer.md; default: synchronous)")
+    lo.add_argument("--sync-mode", choices=["sync", "diloco"], default="sync",
+                    help="diloco: workers take --inner-steps independent optimizer steps (own AdamW state, no "
+                         "gradient all-reduce between workers), then one outer step on the averaged deltas")
+    lo.add_argument("--inner-steps", type=int, default=500, help="H: optimizer steps between outer steps")
+    lo.add_argument("--outer-lr", type=float, default=1.0, help="outer learning rate (1 with momentum 0 = plain "
+                    "averaging, the default; OpenDiLoCo used 0.7 with Nesterov momentum 0.9)")
+    lo.add_argument("--outer-momentum", type=float, default=0.0)
+    lo.add_argument("--outer-nesterov", action=argparse.BooleanOptionalAction, default=True)
+    lo.add_argument("--delta-dtype", choices=dl.DELTA_DTYPES, default="bf16",
+                    help="wire dtype of the deltas (int8: absmax scale per 1024 values)")
+    lo.add_argument("--diloco-fragment-mb", type=int, default=512, help="fp32 MB per exchanged fragment")
+    lo.add_argument("--diloco-transport", choices=["group", "dir", "external"], default="group",
+                    help="group: every rank of this torchrun world is a worker; dir: every site (its own torchrun "
+                         "world, synchronous inside) is a worker and exchanges through --diloco-dir; external: each "
+                         "run trains one round from --start-weights, writes its delta (--delta-out) and stops (the "
+                         "volunteer coordinator merges; drafter-join drives it)")
+    lo.add_argument("--diloco-dir", type=Path, default=None, help="dir transport: directory shared by the sites")
+    lo.add_argument("--sites", type=int, default=1,
+                    help="dir transport: number of sites; external: data partitions (this site reads partition "
+                         "--site)")
+    lo.add_argument("--site", type=int, default=0,
+                    help="dir/external: this site (its ranks read data partition site * world + rank of an index "
+                         "partitioned for sites * world)")
+    lo.add_argument("--diloco-timeout-h", type=float, default=6.0, help="dir transport: wait for peers this long")
+    lo.add_argument("--delta-out", type=Path, default=None,
+                    help="external: delta file (default <output>/deltas/step-<N>.safetensors)")
+    lo.add_argument("--delta-meta", default="{}", help="external: JSON object added to the delta header")
     p.add_argument("--steps", type=int, default=100_000)
     p.add_argument("--grad-accum", type=int, default=1,
                    help="micro-steps per optimizer step; gradients are all-reduced once, after the last")
@@ -840,7 +903,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--dpace-alpha", type=float, default=0.5)
     p.add_argument("--prefix-floor", type=float, default=0.1)
     p.add_argument("--eal-weight", type=float, default=0.0)
-    p.add_argument("--eval-every", type=int, default=1000)
+    p.add_argument("--eval-every", type=int, default=1000, help="0 = no held-out evaluation")
     p.add_argument("--eval-anchors", type=int, default=128)
     p.add_argument("--eval-rows", type=int, default=0, help="0 = all held-out rows")
     p.add_argument("--log-every", type=int, default=10)
@@ -894,6 +957,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         p.error(f"--attn {fp.FLEX_ATTN} needs --compile-layers (uncompiled flex materialises the scores)")
     if args.perf_profile and (args.time_budget_h is not None or args.export):
         p.error("--perf-profile is a measurement mode: no --time-budget-h / --export")
+    if args.start_weights and args.init_from:
+        p.error("--start-weights and --init-from are exclusive")
+    if args.eval_only and not args.eval_every:
+        p.error("--eval-only needs evaluation (--eval-every > 0)")
+    if args.sync_mode == "diloco":
+        if args.inner_steps < 1:
+            p.error("--inner-steps must be >= 1")
+        if args.diloco_transport == "dir":
+            if args.diloco_dir is None or not 0 <= args.site < args.sites:
+                p.error("--diloco-transport dir needs --diloco-dir and 0 <= --site < --sites")
+            if args.time_budget_h is not None:
+                p.error("--diloco-transport dir: sites must agree on --steps (no --time-budget-h)")
+        if args.diloco_transport == "external":
+            if args.start_weights is None or args.time_budget_h is not None or not 0 <= args.site < args.sites:
+                p.error("--diloco-transport external needs --start-weights, 0 <= --site < --sites and no "
+                        "--time-budget-h")
+            if not isinstance(json.loads(args.delta_meta), dict):
+                p.error("--delta-meta must be a JSON object")
+    if args.sites != 1 and not args.eval_only and not (args.sync_mode == "diloco"
+                                                       and args.diloco_transport in ("dir", "external")):
+        p.error("--sites/--site need --sync-mode diloco --diloco-transport dir or external")
     return args
 
 
@@ -903,6 +987,8 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     CPU_AUTOCAST = args.cpu_autocast
     run_started = time.monotonic()
     rank, world, device = init_distributed(args.device)
+    data_rank, data_world = args.site * world + rank, args.sites * world   # = rank, world unless sites > 1
+    external = args.sync_mode == "diloco" and args.diloco_transport == "external"
     if device.type == "cuda" and args.max_mem_fraction:
         torch.cuda.set_per_process_memory_fraction(args.max_mem_fraction, device)
     cfg = sm.load_config(args.config)
@@ -950,6 +1036,10 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
 
     config_digest = hashlib.sha256(json.dumps(cfg, sort_keys=True).encode()).hexdigest()
     parent = init_from_checkpoint(args.init_from, model, rank, config_digest) if args.init_from else None
+    start_record = None
+    if args.start_weights:
+        start_record = load_start_weights(args.start_weights, trainable(model))
+        parent = {"start_weights": start_record}
     if parent is not None:
         init_report = {**init_report, "init_from": parent}
     init_digest = hashlib.sha256(b"".join(
@@ -973,22 +1063,50 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     grad_sync = (GradSync([p for _, p in trainable(model)], world,
                           torch.bfloat16 if args.grad_reduce_dtype == "bf16" else torch.float32,
                           owner=master.owner_of if master is not None else None)
-                 if world > 1 else None)
+                 if world > 1 and not (args.sync_mode == "diloco" and args.diloco_transport == "group") else None)
     optimizer = build_optimizer(owned, args)
-    start_step, counters = load_checkpoint(output, model, optimizer, rank, world, owned)
+    resumed: dict[str, Any] = {}
+    start_step, counters = load_checkpoint(output, model, optimizer, rank, world, owned, resumed)
+    if start_step and (resumed["diloco"] is not None) != (args.sync_mode == "diloco"):
+        raise RuntimeError(f"resume: the checkpoint's sync mode is not --sync-mode {args.sync_mode}")
+    diloco = None
+    if args.sync_mode == "diloco":
+        if args.diloco_transport == "group":
+            transport = dl.ProcessGroupTransport(world)
+        elif args.diloco_transport == "dir":   # one exchange per site (its rank 0); the others get the mean by broadcast
+            transport = (dl.DirectoryTransport(args.diloco_dir, args.site, args.sites, provenance,
+                                               args.diloco_timeout_h * 3600) if rank == 0 else None)
+        else:
+            transport = None
+        diloco = dl.Diloco(owned, transport, lr=args.outer_lr, momentum=args.outer_momentum,
+                           nesterov=args.outer_nesterov, delta_dtype=args.delta_dtype,
+                           fragment_mb=args.diloco_fragment_mb,
+                           site_world=world if args.diloco_transport == "dir" else 1,
+                           meta={"config": config_digest, "init": init_digest, "inner_steps": args.inner_steps},
+                           external=external)
+        if start_step:
+            diloco.load_state_dict(resumed["diloco"])
+        if external:
+            if start_step % args.inner_steps == 0:   # a new round starts from the coordinator's weights
+                if start_step:
+                    load_start_weights(args.start_weights, owned)
+                diloco.set_global(dict(owned), start_record)
+            elif diloco.base.get("sha256") != start_record["sha256"]:
+                raise RuntimeError("resume mid-round: --start-weights is not the weights this round started from")
     if master is not None:
         master.sync_low()
     kwargs = loss_kwargs(device.type, args.unary_loss, args.per_position, args.gamma,
                          args.selector_alpha, args.dpace_alpha)
     selector_prefix = {"floor": args.prefix_floor, "eal_weight": args.eal_weight}
     if capture is not None:
-        stream = cd.CaptureTrainStream(args.capture_index, args.capture_root, rank=rank, world=world,
-                                       seed=args.seed, max_anchors=args.anchors, crop=args.crop,
-                                       source_weights=args.source_weights, pack=args.pack_rows,
-                                       fp8_device=args.fp8_device)
-        eval_groups = held_out_groups(capture, args)
+        if not args.eval_only:
+            stream = cd.CaptureTrainStream(args.capture_index, args.capture_root, rank=data_rank, world=data_world,
+                                           seed=args.seed, max_anchors=args.anchors, crop=args.crop,
+                                           source_weights=args.source_weights, pack=args.pack_rows,
+                                           fp8_device=args.fp8_device)
+        eval_groups = held_out_groups(capture, args) if args.eval_every else {}
         first_group = next(iter(eval_groups), None)
-        if not first_group or not eval_groups[first_group]:
+        if args.eval_every and (not first_group or not eval_groups[first_group]):
             raise SystemExit("capture index has no held-out rows with eligible anchors")
         row_info = {r["name"]: r for rows in eval_groups.values() for r in rows}
         bucket_of = ((lambda name: row_info[name].get(args.eval_breakdown)) if args.eval_breakdown else None)
@@ -1009,12 +1127,25 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     else:
         train_rows = store.split("train")
         heldout_rows = store.split("heldout")[: args.eval_rows or None]
-        if not train_rows or not heldout_rows:
-            raise SystemExit("feature store needs train and heldout rows")
+        if (not train_rows and not args.eval_only) or (not heldout_rows and args.eval_every):
+            raise SystemExit("feature store needs train rows (training) and heldout rows (evaluation)")
 
         def run_eval() -> dict[str, Any]:
             return evaluate(model, rowstore_eval_samples(store, heldout_rows, args, model.block_size, rank, world),
                             kwargs, device, compute_dtype, world)
+    if args.eval_only:
+        record = {"phase": "eval", "step": 0, "tokens_seen": 0, **run_eval()}
+        emit(record)
+        barrier(world)
+        if world > 1:
+            dist.destroy_process_group()
+        return {"eval": record, "start_weights": start_record}
+    if diloco is not None and not external:   # evaluations see the global weights
+        local_eval = run_eval
+
+        def run_eval() -> dict[str, Any]:
+            with diloco.global_weights(master.sync_low if master is not None else None):
+                return local_eval()
     if args.perf_profile:
         # Measurement mode: no evals, checkpoints or export; log every step.
         args.steps = start_step + args.perf_warmup + args.perf_profile
@@ -1028,7 +1159,8 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
                 "body_keys": body_keys, "world": world, "args": {k: str(v) for k, v in vars(args).items()},
             }, indent=2))
         eval_started = time.monotonic()
-        emit({"phase": "eval", "step": 0, "tokens_seen": 0, **run_eval()})
+        if args.eval_every:
+            emit({"phase": "eval", "step": 0, "tokens_seen": 0, **run_eval()})
         eval_s = time.monotonic() - eval_started
         if args.probe:
             try:
@@ -1064,6 +1196,8 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     started = time.monotonic()
     step = start_step
     tokens_seen = float(counters.get("tokens_seen", 0.0))
+    round_start_tokens = float(counters.get("round_start_tokens", tokens_seen))   # DiLoCo: tokens of this round
+    finished: dict[str, Any] | None = None   # external DiLoCo: the round's delta record
     samples = None
     loader_stats: dict[str, float] = {}
     if capture is not None:
@@ -1105,7 +1239,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         deferred: dict[str, torch.Tensor] = {}   # --deferred-metrics: device-side sums
         step_rows: list[str] = []
         for micro in range(args.grad_accum):
-            global_index = (step * args.grad_accum + micro) * world + rank
+            global_index = (step * args.grad_accum + micro) * data_world + data_rank
             if samples is not None:
                 waited = time.monotonic()
                 sample = next(samples)
@@ -1194,6 +1328,12 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
             torch.cuda.synchronize(device)
         completed = step + 1
         step += 1
+        round_end = diloco is not None and (completed % args.inner_steps == 0 or completed == args.steps)
+        if round_end and not external:
+            outer = diloco.outer_step(completed)
+            if master is not None:
+                master.sync_low()
+            emit({"phase": "outer", **outer})
         free, peak = memory_consensus(device, world)
         watts = gpu_watts(device)
         if world > 1:
@@ -1319,14 +1459,32 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
             record.update(peak_mem_gb=round(peak, 2), min_mem_available_gb=round(free, 2))
             emit(record)
             window = dict.fromkeys(window, 0.0)
-        if completed % args.eval_every == 0 or completed == args.steps:
+        if args.eval_every and (completed % args.eval_every == 0 or completed == args.steps):
             emit({"phase": "eval", "step": completed, "tokens_seen": tokens_seen, **run_eval()})
-        if completed % args.checkpoint_every == 0 or completed == args.steps:
+        if round_end and external:
+            path = args.delta_out or output / "deltas" / f"step-{completed:07d}.safetensors"
+            meta = {**json.loads(args.delta_meta), "trainer": TRAINER_VERSION, "config_sha256": dl.config_sha256(cfg),
+                    "step_start": ((completed - 1) // args.inner_steps) * args.inner_steps, "step_end": completed,
+                    "inner_steps": args.inner_steps, "tokens": tokens_seen - round_start_tokens,
+                    "seed": args.seed, "world": world}
+            if rank == 0:
+                finished = {"delta": str(path), **diloco.write_delta(path, provenance, meta)}
+                emit({"phase": "delta", **finished})
+            else:
+                diloco.round += 1
+            barrier(world)
+        if round_end:
+            round_start_tokens = tokens_seen
+        if completed % args.checkpoint_every == 0 or completed == args.steps or (round_end and external):
             save_checkpoint(output, completed, model, optimizer, rank, world, provenance,
                             {"tokens_seen": tokens_seen, "eval_s": eval_s,
+                             **({"round_start_tokens": round_start_tokens} if diloco is not None else {}),
                              **({"planned_steps": args.steps} if args.time_budget_h is not None else {}),
                              **({"cap_switch_item": cap_switch} if cap_switch is not None else {})}, owned,
-                            keep=args.keep_checkpoints)
+                            keep=args.keep_checkpoints,
+                            extra={"diloco": diloco.state_dict()} if diloco is not None else None)
+        if round_end and external:
+            break   # one round per run: the coordinator merges, the next run starts from its weights
         if args.stop_after is not None and completed >= args.stop_after:
             barrier(world)
             if world > 1:
@@ -1335,6 +1493,11 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
 
     del samples
     power.close()
+    if external:
+        barrier(world)
+        if world > 1:
+            dist.destroy_process_group()
+        return finished or {"completed_steps": step}
     result: dict[str, Any] = {"completed_steps": args.steps}
     if capture is not None and args.source_weights:
         emit({"phase": "sources", **sources_record(stream, args.steps * args.grad_accum, world)})

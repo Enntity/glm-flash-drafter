@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Join Drafter Training</title>
+<meta name="description" content="Redeem an invite to run a volunteer training site for the GLM-5.3-Flash drafter.">
+<link rel="stylesheet" href="static/style.css">
+<script src="static/app.js" defer></script>
+</head>
+<body data-page="join">
+<header>
+  <h1>Join volunteer training</h1>
+  <nav><a href="./">Dashboard</a><a href="how">How it works</a></nav>
+</header>
+<main>
+<article>
+  <h2>1. Requirements</h2>
+  <p>Two GB10-class GPUs (for example two DGX Spark nodes) for recipe mode, where your site generates and captures
+  its own training data with GLM-5.3-Flash in TP2; training itself fits one GPU. A clone of the project's
+  repository and your own copy of GLM-5.3-Flash.</p>
+  <h2>2. Redeem your invite on the machine that will train</h2>
+  <div id="invite">Loading...</div>
+  <p class="sub">The invite code in this link never left your browser: URL fragments are not sent to servers.
+  The code works once.</p>
+  <h2>3. Follow JOIN.md</h2>
+  <p>JOIN.md in the repository is a step-by-step runbook (written so a coding agent can follow it): preflight
+  checks, setup, the canary, then <code>drafter-join run</code>.</p>
+</article>
+</main>
+<footer>No trackers, no third-party requests.</footer>
+</body>
+</html>
