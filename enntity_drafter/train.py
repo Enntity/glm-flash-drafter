@@ -1218,7 +1218,9 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         fp.register_packed_attention()
     if args.attn == fp.FLEX_ATTN:
         fp.register_flex_attention()
-    model = sm.build_model(cfg, attn_implementation=args.attn)
+    # built on the device: upstream random init on the CPU took ~20 s per start; scratch_init (CPU generator) still
+    # sets every body parameter, so fresh starts are unchanged
+    model = sm.build_model(cfg, device=device, attn_implementation=args.attn)
     if args.attn == fp.PACKED_ATTN:
         fp.install_packed_attention(model, args.anchors_per_chunk)
     if args.attn == fp.FLEX_ATTN:

@@ -21,6 +21,9 @@ os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
 # Speculators resolves the verifier norm convention via AutoConfig; never reach
 # the network for that (GLM uses the plain x*w final norm).
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
+# The fused loss kernels autotune at every process start (~7 s per trainer, self-check or validator eval);
+# keep the timings in the Triton cache instead.
+os.environ.setdefault("TRITON_CACHE_AUTOTUNING", "1")
 
 import torch  # noqa: E402
 from torch import nn  # noqa: E402
