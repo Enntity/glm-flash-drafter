@@ -43,6 +43,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--from-checkpoint", type=Path, help="init: version 0 from a trainer checkpoint directory")
     p.add_argument("--publish-dtype", choices=["bf16", "fp32"], default="bf16")
     p.add_argument("--min-deltas", type=int, default=2)
+    p.add_argument("--min-sites", type=int, default=1, help="distinct sites required, even after round timeout")
     p.add_argument("--min-round-s", type=float, default=1800)
     p.add_argument("--round-timeout-s", type=float, default=3600)
     p.add_argument("--hold-drop", type=float, default=Thresholds.hold_drop)
@@ -77,7 +78,7 @@ def main(argv: list[str] | None = None) -> None:
         ApiClient(a.coordinator, a.token_file.read_text().strip()), a.workdir,
         lambda path: metrics_of(evaluate(path, eval_args, inprocess=False)), requirements=requirements,
         thresholds=Thresholds(hold_drop=a.hold_drop, reject_drop=a.reject_drop, borderline=a.borderline),
-        publish_dtype=a.publish_dtype, min_deltas=a.min_deltas, min_round_s=a.min_round_s,
+        publish_dtype=a.publish_dtype, min_deltas=a.min_deltas, min_sites=a.min_sites, min_round_s=a.min_round_s,
         round_timeout_s=a.round_timeout_s, heldout_id=heldout_id, signing_key=signing_key)
     if a.cmd == "init":
         if a.from_checkpoint is None:

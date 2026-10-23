@@ -44,7 +44,8 @@ def score(metrics: dict[str, float]) -> float:
     return sum(groups) / max(len(groups), 1)
 
 
-def merge_weights(items: list[dict[str, Any]], current: int, thresholds: Thresholds) -> list[float]:
+def merge_weights(items: list[dict[str, Any]], current: int, thresholds: Thresholds, *,
+                  attenuate: bool = True) -> list[float]:
     """Merge weight per accepted delta.  Tokens are self-reported, so they are trusted only across sites: each site's
     total for the round is capped at ``token_factor`` x the median site total (one value per site), and with fewer
     than ``min_token_sites`` sites every site weighs the same.  A site's budget is shared by its deltas in
@@ -52,6 +53,10 @@ def merge_weights(items: list[dict[str, Any]], current: int, thresholds: Thresho
 
     def tokens(item: dict[str, Any]) -> float:
         return max(float(item["meta"].get("tokens") or 0.0), 1.0)
+
+    def factor(item: dict[str, Any]) -> float:
+        value = item["verdict"].get("weight_factor")
+        return 1.0 if value is None else float(value)
 
     totals: dict[str, float] = {}
     for item in items:
@@ -62,8 +67,9 @@ def merge_weights(items: list[dict[str, Any]], current: int, thresholds: Thresho
     else:
         budget = dict.fromkeys(totals, 1.0)
     return [budget[item["site"]] * tokens(item) / totals[item["site"]]
-            * float(item["verdict"].get("weight_factor") or 1.0)
-            * thresholds.stale_decay ** max(0, current - item["base_version"]) for item in items]
+            * ((factor(item)
+                * thresholds.stale_decay ** max(0, current - item["base_version"])) if attenuate else 1.0)
+            for item in items]
 
 
 def _decode(handle, name: str, shape: tuple[int, ...], dtype: str) -> torch.Tensor:
@@ -73,14 +79,23 @@ def _decode(handle, name: str, shape: tuple[int, ...], dtype: str) -> torch.Tens
 
 def merge_streamed(master: Path, deltas: list[tuple[Path, float]], out_master: Path, out_published: Path | None,
                    publish_dtype: str, meta: dict[str, Any], lr: float = 1.0, momentum: float = 0.0,
-                   nesterov: bool = True, momentum_in: Path | None = None, momentum_out: Path | None = None
+                   nesterov: bool = True, momentum_in: Path | None = None, momentum_out: Path | None = None,
+                   normalizer: float | None = None
                    ) -> tuple[str, str]:
-    """New global = master - lr * u (``dl.outer_update``) with u from the weighted mean of the deltas.  Equal
-    weights take the plain mean in arrival order (bitwise the trainer's own DiLoCo average)."""
+    """New global = master - lr * u (``dl.outer_update``), with the weighted delta sum divided by normalizer.
+    Omitting normalizer preserves legacy normalization by the sum of weights. Equal, unattenuated weights
+    take the plain mean in arrival order (bitwise the trainer's own DiLoCo average)."""
 
     shapes = {name: shape for name, (_, shape) in layout(master).items()}
     weights = [w for _, w in deltas]
-    equal = len(set(weights)) == 1
+    if not weights or any(not math.isfinite(w) or w < 0 for w in weights):
+        raise ValueError("merge requires finite nonnegative weights and at least one delta")
+    denominator = sum(weights) if normalizer is None else normalizer
+    if not math.isfinite(denominator) or denominator <= 0:
+        raise ValueError("merge normalizer must be finite and positive")
+    # Preserve the unattenuated site's budget in the denominator. Otherwise
+    # a singleton (or equally penalized batch) cancels its reduction entirely.
+    equal = len(set(weights)) == 1 and weights[0] > 0 and denominator == sum(weights)
     stamp = weights_stamp(master)
     header = {**stamp, "weights": json.dumps({"schema": dl.WEIGHTS_SCHEMA, "dtype": "fp32", **meta})}
     entries = [(n, torch.float32, s) for n, s in shapes.items()]
@@ -101,7 +116,7 @@ def merge_streamed(master: Path, deltas: list[tuple[Path, float]], out_master: P
                 mean = torch.zeros_like(param)
                 for handle, dtype, weight in zip(handles, dtypes, weights):
                     mean.add_(_decode(handle, name, shape, dtype), alpha=1.0 if equal else weight)
-                mean.div_(len(weights) if equal else sum(weights))
+                mean.div_(len(weights) if equal else denominator)
                 moment = None
                 if momentum:
                     moment = momentum_handle.get_tensor(name).float() if momentum_handle else torch.zeros_like(param)
@@ -161,7 +176,7 @@ def cosine(a_path: Path, b_path: Path, base_path: Path) -> float:
 class Validator:
     def __init__(self, api: ApiClient, workdir: str | Path, evaluate: Callable[[Path], dict[str, float]], *,
                  requirements: dict[str, Any] | None = None, thresholds: Thresholds | None = None,
-                 version: str = VALIDATOR_VERSION, publish_dtype: str = "bf16", min_deltas: int = 2,
+                 version: str = VALIDATOR_VERSION, publish_dtype: str = "bf16", min_deltas: int = 2, min_sites: int = 1,
                  min_round_s: float = 0.0, round_timeout_s: float = 3600.0, outer_lr: float = 1.0,
                  outer_momentum: float = 0.0, outer_nesterov: bool = True, heldout_id: str = "",
                  keep_local: int = 9, replayer: Callable[[dict[str, Any], Path], Path] | None = None,
@@ -171,6 +186,9 @@ class Validator:
         self.requirements = dict(requirements or {})
         self.thresholds, self.version, self.publish_dtype = thresholds or Thresholds(), version, publish_dtype
         self.min_deltas, self.min_round_s, self.round_timeout_s = min_deltas, min_round_s, round_timeout_s
+        if min_sites < 1:
+            raise ValueError("min_sites must be positive")
+        self.min_sites = min_sites
         self.outer = {"lr": outer_lr, "momentum": outer_momentum, "nesterov": outer_nesterov}
         self.heldout_id, self.keep_local, self.clock, self.log = heldout_id, keep_local, clock, log
         self.replayer, self.spot_check_rate, self.spot_cosine = replayer, spot_check_rate, spot_cosine
@@ -410,7 +428,7 @@ class Validator:
             plan = self.state["pending_merge"] = None   # stale (already published, or the network moved on)
         if plan is None:
             items = self.api.call("GET", "/api/v1/validator/mergeable")
-            if not items:
+            if not items or len({i["site"] for i in items}) < self.min_sites:
                 return None
             oldest = min(item["received"] for item in items)
             ready = len(items) >= self.min_deltas or self.clock() - oldest >= self.round_timeout_s
@@ -431,10 +449,11 @@ class Validator:
                         self._forget_sketches([item])
                         continue
                 usable.append(item)
-            if not usable:
+            if not usable or len({i["site"] for i in usable}) < self.min_sites:
                 return None
             weights = merge_weights(usable, version, self.thresholds)
             plan = {"version": version + 1, "parent_sha256": current["sha256"],
+                    "normalizer": sum(merge_weights(usable, version, self.thresholds, attenuate=False)),
                     "items": [{"delta_id": i["delta_id"], "weight": w, "site": i["site"],
                                "base_version": i["base_version"]} for i, w in zip(usable, weights)]}
             self.state["pending_merge"] = plan
@@ -452,6 +471,7 @@ class Validator:
         merge_streamed(master, list(zip(files, [i["weight"] for i in plan["items"]])), self.master(version + 1),
                        self.published(version + 1), self.publish_dtype,
                        {"version": version + 1, "parent_sha256": plan["parent_sha256"], "merged": len(files)},
+                       normalizer=plan.get("normalizer"),
                        momentum_in=momentum_in if momentum_in.is_file() else None, momentum_out=momentum_out,
                        **self.outer)   # reads only version-keyed inputs: a re-run is idempotent
         published = self.published(version + 1)

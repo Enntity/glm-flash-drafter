@@ -36,7 +36,7 @@ import torch
 from . import diloco as dl
 from .guard import ForbiddenCheckpointError, check_path, guarded_safe_open
 
-VALIDATOR_VERSION = "2"   # 2: canaries are judged by judge_canary
+VALIDATOR_VERSION = "3"   # 3: merge penalties attenuate the absolute update
 ST_DTYPES = {torch.float32: "F32", torch.bfloat16: "BF16", torch.int8: "I8"}
 ST_NAMES = {v: k for k, v in ST_DTYPES.items()}
 

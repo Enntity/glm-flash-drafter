@@ -3,6 +3,13 @@
 Thanks for helping. This project trains a drafter whose value depends on its
 license, so the rules on data and weights are strict.
 
+## Start here
+
+Fork the repository, create a branch, and follow the [CPU quick start](README.md#quick-start-cpu-tests).
+No GPU, network invite, private dataset or teacher checkpoint is needed for the tiny-model tests.
+For a first change, improve a failing error message, a prompt builder with documented provenance, or the
+[site runbook](JOIN.md). Explain the problem, the changed behavior and the focused test command in your PR.
+
 ## Before you open a pull request
 
 - **License.** Contributions are accepted under Apache-2.0 (the repository
@@ -20,7 +27,7 @@ license, so the rules on data and weights are strict.
   (say which in the module docstring and the row `license` field).
 - **No private or personal data**, no hostnames, addresses, keys or tokens.
 - **Tests.** Add a CPU test for new behaviour. Run the files you touched:
-  `OMP_NUM_THREADS=1 python -m unittest discover -s tests -p test_<name>.py -v`.
+  `CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m unittest discover -s tests -p test_<name>.py -v`.
 - **Numbers.** A performance or acceptance claim needs the command, the commit,
   the hardware and the raw output. Report losing cells as well as winning ones,
   and give run-to-run spread when you have it.
@@ -28,7 +35,7 @@ license, so the rules on data and weights are strict.
 ## Contributing compute
 
 Volunteer training sites contribute compute, not data: only weight deltas and counters are uploaded. Joining is by
-invite; see [JOIN.md](JOIN.md) and [docs/volunteer.md](docs/volunteer.md). Shared datasets are not accepted.
+invite; [request one](https://github.com/Enntity/glm-flash-drafter/issues/new?template=compute-site.yml), then see [JOIN.md](JOIN.md) and [docs/volunteer.md](docs/volunteer.md). Shared datasets are not accepted.
 
 ## Style
 
