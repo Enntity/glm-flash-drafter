@@ -54,6 +54,10 @@ def merge_weights(items: list[dict[str, Any]], current: int, thresholds: Thresho
     def tokens(item: dict[str, Any]) -> float:
         return max(float(item["meta"].get("tokens") or 0.0), 1.0)
 
+    def factor(item: dict[str, Any]) -> float:
+        value = item["verdict"].get("weight_factor")
+        return 1.0 if value is None else float(value)
+
     totals: dict[str, float] = {}
     for item in items:
         totals[item["site"]] = totals.get(item["site"], 0.0) + tokens(item)
@@ -63,7 +67,7 @@ def merge_weights(items: list[dict[str, Any]], current: int, thresholds: Thresho
     else:
         budget = dict.fromkeys(totals, 1.0)
     return [budget[item["site"]] * tokens(item) / totals[item["site"]]
-            * ((float(item["verdict"].get("weight_factor", 1.0))
+            * ((factor(item)
                 * thresholds.stale_decay ** max(0, current - item["base_version"])) if attenuate else 1.0)
             for item in items]
 
@@ -78,8 +82,9 @@ def merge_streamed(master: Path, deltas: list[tuple[Path, float]], out_master: P
                    nesterov: bool = True, momentum_in: Path | None = None, momentum_out: Path | None = None,
                    normalizer: float | None = None
                    ) -> tuple[str, str]:
-    """New global = master - lr * u (``dl.outer_update``) with u from the weighted mean of the deltas.  Equal
-    weights take the plain mean in arrival order (bitwise the trainer's own DiLoCo average)."""
+    """New global = master - lr * u (``dl.outer_update``), with the weighted delta sum divided by normalizer.
+    Omitting normalizer preserves legacy normalization by the sum of weights. Equal, unattenuated weights
+    take the plain mean in arrival order (bitwise the trainer's own DiLoCo average)."""
 
     shapes = {name: shape for name, (_, shape) in layout(master).items()}
     weights = [w for _, w in deltas]

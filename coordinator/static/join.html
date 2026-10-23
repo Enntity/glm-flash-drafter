@@ -16,16 +16,21 @@
 <main>
 <article>
   <h2>1. Requirements</h2>
-  <p>Two GB10-class GPUs (for example two DGX Spark nodes) for recipe mode, where your site generates and captures
-  its own training data with GLM-5.3-Flash in TP2; training itself fits one GPU. A clone of the project's
-  repository and your own copy of GLM-5.3-Flash.</p>
+  <p>The tested path uses one 128 GB GB10 (for example one DGX Spark) per independent site with your own
+  compatible captures. Recipe mode needs two local GPUs to generate and capture GLM-5.3-Flash data in TP2;
+  its full-size multi-site path is still experimental. You need your own teacher files and training data.</p>
+  <p>Start with the <a href="https://github.com/Enntity/glm-flash-drafter/blob/main/JOIN.md" rel="noreferrer">site runbook</a>
+  for installation, disk and memory requirements. No invite yet?
+  <a href="https://github.com/Enntity/glm-flash-drafter/issues/new?template=compute-site.yml" rel="noreferrer">Request one</a>
+  with a hardware summary. Do not post credentials, invite links, machine addresses or data in the issue.</p>
   <h2>2. Redeem your invite on the machine that will train</h2>
   <div id="invite">Loading...</div>
   <p class="sub">The invite code in this link never left your browser: URL fragments are not sent to servers.
   The code works once.</p>
   <h2>3. Follow JOIN.md</h2>
-  <p>JOIN.md in the repository is a step-by-step runbook (written so a coding agent can follow it): preflight
-  checks, setup, the canary, then <code>drafter-join run</code>.</p>
+  <p><a href="https://github.com/Enntity/glm-flash-drafter/blob/main/JOIN.md" rel="noreferrer">JOIN.md</a>
+  walks through preflight, setup, the canary, then <code>drafter-join run</code>. The canary tests the pipeline;
+  only a regular delta with status <code>merged</code> has contributed to a published global.</p>
 </article>
 </main>
 <footer>No trackers, no third-party requests.</footer>

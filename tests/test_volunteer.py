@@ -369,7 +369,8 @@ class ClientTests(unittest.TestCase):
             delta = write_delta(root / "delta.safetensors", {"x": torch.tensor([2.0])}, sha, {})
             for lag, factor, count, expected in [(0, 1.0, 1, 8.0), (1, 1.0, 1, 9.0),
                                                  (2, 1.0, 1, 9.5), (0, 0.5, 1, 9.0),
-                                                 (1, 0.5, 2, 9.5), (0, 0.0, 1, 10.0)]:
+                                                 (1, 0.5, 2, 9.5), (0, 0.0, 1, 10.0),
+                                                 (0, None, 1, 8.0)]:
                 with self.subTest(lag=lag, factor=factor, count=count):
                     items = [{"site": str(i), "meta": {"tokens": 1000},
                               "verdict": {"weight_factor": factor}, "base_version": 5-lag}
@@ -380,6 +381,15 @@ class ClientTests(unittest.TestCase):
                     merge_streamed(master, [(delta, w) for w in weights], out, None, "fp32", {},
                                    normalizer=normalizer)
                     self.assertEqual(dl.load_weights(out)[0]["x"].item(), expected)
+
+            # A plan persisted before normalizer existed must retain its old bytes on replay.
+            merge_streamed(master, [(delta, 0.5)], out, None, "fp32", {})
+            self.assertEqual(dl.load_weights(out)[0]["x"].item(), 8.0)
+            for weights, normalizer in [([float("nan")], 1), ([-1], 1), ([1], 0),
+                                        ([1], float("inf")), ([], 1)]:
+                with self.subTest(weights=weights, normalizer=normalizer), self.assertRaises(ValueError):
+                    merge_streamed(master, [(delta, w) for w in weights], out, None, "fp32", {},
+                                   normalizer=normalizer)
 
     def test_canary_judge_is_sanity_only(self):   # dogfood: a canary rejected for an 8% public check-set dip
         thresholds = Thresholds()
@@ -1064,6 +1074,7 @@ class FailureInjectionTests(unittest.TestCase):
 
     def test_object_changed_after_acceptance_is_quarantined_at_merge(self):   # review 10
         self.validator.min_deltas = 3
+        self.validator.min_sites = 2
         a, b = self.upload(self.sites[0]), self.upload(self.sites[1])
         self.validator.step()
         (self.validator.workdir / "inbox" / f"{a}.safetensors").unlink()
@@ -1074,6 +1085,10 @@ class FailureInjectionTests(unittest.TestCase):
         self.validator.min_deltas = 1
         self.validator.step()
         self.assertEqual(self.states()[a], ("quarantined", "hash_mismatch"))
+        self.assertEqual(self.states()[b][0], "accepted")
+        self.assertEqual(self.current()[0], 0)   # losing a site during download must not bypass the quorum
+        self.upload(self.sites[0])
+        self.validator.step()
         self.assertEqual(self.states()[b][0], "merged")
 
     def test_globals_are_signed_and_sites_verify_the_signature(self):   # review LOW

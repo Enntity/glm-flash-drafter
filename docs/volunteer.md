@@ -4,9 +4,12 @@ Several sites train one drafter together, exchanging only weights, never data. T
 speculative-decoding drafter. This page covers the design, what a site spends, the trust model and what is not
 built yet. To run a site, follow [JOIN.md](../JOIN.md); to operate the network, see [operators.md](operators.md).
 
-Status: **live, invite-only pilot.** Enntity runs a coordinator and a validator; sites join with an invite link
+Status: **live, invite-only pilot; outside contributors welcome.**
+[Request a compute-site invite](https://github.com/Enntity/glm-flash-drafter/issues/new?template=compute-site.yml).
+Enntity runs a coordinator and a validator; sites join with an invite link
 from the operator, and the coordinator URL is the part of that link before `/join`. Its public dashboard is at that
-URL itself (`https://<host>/<path>/`). Everything below also runs in this repository's tests on a tiny model; the
+URL itself (`https://<host>/<path>/`). Full-size bring-your-own-capture training has completed repeated merges
+from two independent single-GB10 sites. Everything below also runs in this repository's tests on a tiny model; the
 full-size recipe path (generation and capture on a site) has not yet been run end to end across sites.
 
 ## How it works
@@ -40,7 +43,9 @@ full-size recipe path (generation and capture on a site) has not yet been run en
 - **Merge.** The validator averages accepted deltas weighted by tokens trained and applies the outer step with
   learning rate 1 and no momentum: plain averaging. Tokens are self-reported, so they only count across sites:
   each site's total in a round is capped at twice the median site total, every site weighs the same when fewer
-  than three sites are in the round, and a site may have at most 3 unmerged deltas. A delta nearly identical to
+  than three sites are in the round, and a site may have at most 3 unmerged deltas. Staleness and borderline penalties reduce the absolute update;
+  the denominator remains the budget before penalties. Operators can require at least two distinct sites with
+  `--min-sites 2`; timeouts never waive that minimum. A delta nearly identical to
   another one of the round (cosine above 0.995) is quarantined.
 - **Merge gate.** A merged global is evaluated on the private held-out set before it is published. If any group
   is more than 1% below the best published global, or clearly below version 0, it is not published and its

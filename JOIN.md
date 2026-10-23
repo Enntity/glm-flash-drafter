@@ -6,6 +6,22 @@ will train. Stop at the first step whose check fails and report its output.
 
 Background: [docs/volunteer.md](docs/volunteer.md). Only weight deltas and counters leave the site.
 
+**New contributor?** [Request a compute-site invite](https://github.com/Enntity/glm-flash-drafter/issues/new?template=compute-site.yml).
+Give your GPU model/count, RAM, free disk, software versions and whether you already have compatible captures.
+Do not attach data, credentials, invite links, or machine addresses. The operator arranges private delivery of a
+one-use invite. Code and documentation contributions do not need an invite; see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+**Tested starting path:** bring-your-own captures on one 128 GB GB10 per site, Linux aarch64, CUDA 13 and
+PyTorch 2.11 or 2.12. Two such independent sites have completed full-size train, upload, validation and merge
+cycles. This is asynchronous training: each site trains the whole drafter; contributors do not need a link to
+another contributor's GPU. Recipe mode needs two local GPUs for capture and has not yet completed a full-size
+end-to-end multi-site qualification. Other hardware is not yet qualified.
+
+Before accepting an invite, plan for your own teacher files, captures, checkpoints and transfer costs. The
+preflight requires 60 GiB available host memory and recommends at least 500 GiB free workspace. A full-size round
+currently transfers roughly 2.34 GB of global weights down and 1.18 GB of int8 delta up. Keep one registration and
+one running client per site; use a separate registration and work directory for each additional site.
+
 ## Safety rules (always)
 
 1. **GB10 memory is shared by CPU and GPU; exhausting it can hang the host.** Never start the GLM-5.3-Flash
@@ -37,15 +53,28 @@ the trainer's GPU kernels on the first training step and needs both; the CPU smo
   `-slim`) started with `docker run --gpus all -it -v "$PWD":/work -w /work python:3.12 bash` (needs the NVIDIA
   Container Toolkit), then the steps below inside it.
 
-```
+```sh
+git clone https://github.com/Enntity/glm-flash-drafter.git
+cd glm-flash-drafter
 python3 -m venv .venv && . .venv/bin/activate
-pip install 'torch>=2.11,<2.13' numpy safetensors transformers cryptography pyyaml tokenizers jinja2
+python -m pip install --upgrade pip
+python -m pip install 'torch>=2.11,<2.13' numpy safetensors transformers cryptography pyyaml tokenizers jinja2
 bash scripts/install_speculators.sh
-pip install -e .
+python -m pip install -e .
 drafter-join --help
 ```
 
-Check: the last command prints usage starting with `usage: drafter-join`. `install_speculators.sh` keeps the
+Use a CUDA-enabled PyTorch build compatible with your GPU and driver. Check before registering:
+
+```sh
+python -c 'import torch; print(torch.__version__, torch.version.cuda); assert torch.cuda.is_available(), "CUDA unavailable"; print(torch.cuda.get_device_name())'
+git rev-parse HEAD
+```
+
+Keep the commit with your run notes. A CPU-only installation can run unit tests but cannot qualify a full-size
+training site. Re-run this check inside the environment or container that will actually run the trainer.
+
+Check: the last installation command prints usage starting with `usage: drafter-join`. `install_speculators.sh` keeps the
 installed torch and does not install `torchaudio` or `torchvision` (speculators lists them but does not use them;
 `pip check` mentions them, which is expected). It does move `transformers` into speculators' tested range
 (below 5.17), downgrading a newer one on purpose.
@@ -172,6 +201,8 @@ Description=drafter-join volunteer site
 [Service]
 WorkingDirectory=<repository>
 ExecStart=/bin/bash -c 'ulimit -n $(ulimit -Hn) && exec <repository>/.venv/bin/drafter-join run --teacher <GLM dir> [mode flags]'
+KillMode=control-group
+TimeoutStopSec=180
 Restart=on-failure
 RestartSec=300
 
@@ -209,6 +240,16 @@ Check: `coordinator.deltas` lists your deltas with `state` `pending`, `accepted`
 with `reason_code` and `reason`; quarantined deltas are kept and re-validated if the validator is fixed, and your
 tokens stay credited. The network's public dashboard shows your site and totals: open the coordinator URL from your
 invite link (the part before `/join`, `https://<host>/<path>/`).
+
+A successful canary confirms registration, signed-global download, local training, upload and central validation.
+It does **not** count as a merged contribution. After a regular round, `merged` confirms that your delta was used
+in a published global. `accepted` can wait for the network's distinct-site quorum. With a two-site minimum,
+several deltas from one site cannot satisfy the quorum, even after the round timeout. Keep the client running;
+it preserves finished work during backpressure. The public held-out curve is delayed by at least an hour.
+
+For support, include your public site ID, checkout commit, phase, error code and a short redacted log excerpt in
+a [GitHub issue](https://github.com/Enntity/glm-flash-drafter/issues). Never attach `config.json`, an invite link,
+signed storage URLs, model files or source data.
 
 ## Troubleshooting
 

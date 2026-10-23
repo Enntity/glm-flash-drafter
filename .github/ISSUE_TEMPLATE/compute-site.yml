@@ -1,0 +1,43 @@
+name: Request a compute-site invite
+description: Offer compute for the invite-only GLM drafter training pilot.
+title: "Compute-site request: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for offering compute. Read [JOIN.md](https://github.com/Enntity/glm-flash-drafter/blob/main/JOIN.md) first.
+        This issue is public. Do not include addresses, credentials, invite links, private data, or config files.
+        A maintainer will arrange private delivery of a one-use invite after reviewing readiness.
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware and software
+      description: GPU model/count, host RAM, available disk, OS/architecture, CUDA driver and PyTorch versions.
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Intended contribution path
+      options:
+        - Bring my own compatible captures (qualified path)
+        - Prepare my own captures (need help)
+        - Recipe generation and capture (experimental)
+    validations:
+      required: true
+  - type: textarea
+    id: availability
+    attributes:
+      label: Availability and readiness
+      description: Approximate hours available, dedicated or shared host, and any setup blockers. Describe data provenance without sharing the data.
+    validations:
+      required: true
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Before joining
+      options:
+        - label: I have read JOIN.md and CONTRIBUTING.md and can use the proposed data and teacher output under their stated terms.
+          required: true
+        - label: I understand this is research, incurs compute and transfer costs, and does not guarantee a faster drafter.
+          required: true

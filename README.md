@@ -7,7 +7,8 @@ drafter targets GB10 / DGX Spark-class hardware served by the
 [Atlas](https://github.com/Enntity/atlas) engine (as in
 [SparkGLM](https://github.com/Enntity/sparkglm)).
 
-Status: **research, early.** No weights are published yet. Everything here is
+Status: **research, early; outside contributors welcome.** Signed training globals are available to registered
+compute sites; there is no qualified inference-weight release yet. Everything here is
 measured on Enntity's own two-node GB10 setup; numbers are from single runs
 unless stated.
 
@@ -128,7 +129,9 @@ More: [docs/pipeline.md](docs/pipeline.md), [docs/capture.md](docs/capture.md)
 
 ## How to help
 
-- **Run a volunteer training site** (live, invite-only pilot). Sites train the whole drafter on their own data for
+- **Run a volunteer training site** (live, invite-only pilot).
+  [Request an invite](https://github.com/Enntity/glm-flash-drafter/issues/new?template=compute-site.yml);
+  no invite is needed to contribute code or docs. Sites train the whole drafter on their own data for
   short rounds and upload only weight deltas; a validator checks each delta on a private held-out set and merges
   accepted ones by token-weighted plain averaging (DiLoCo with outer learning rate 1, which matched or beat
   synchronous training in a two-site A/B). Joining is by invite: with a link from the operator, follow
@@ -155,12 +158,12 @@ bring-your-own-data sites keep their data. See [CONTRIBUTING.md](CONTRIBUTING.md
 
 ```
 python -m venv .venv && . .venv/bin/activate
-pip install torch numpy safetensors transformers pyyaml
+pip install 'torch>=2.11,<2.13' numpy safetensors transformers pyyaml
 bash scripts/install_speculators.sh
 pip install -e .
-OMP_NUM_THREADS=1 python -m unittest discover -s tests -v
+CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m unittest discover -s tests -p test_volunteer.py -v
 ```
 
-The suite trains tiny models with 1-2 CPU processes (gloo) and takes tens of
-minutes; run one file with `-p test_train.py`. The volunteer-training tests are
+This command checks the contributor client and merge protocol on tiny CPU models.
+Run the test file relevant to your change; the full suite takes tens of minutes. The volunteer-training tests are
 `tests/test_diloco.py`, `tests/test_coordinator.py` and `tests/test_volunteer.py`.
