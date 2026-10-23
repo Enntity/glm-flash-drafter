@@ -195,3 +195,19 @@ python -m validator run   (same flags)
 - Deltas are safetensors only; the validator reads them through the license guard (`enntity_drafter/guard.py`).
 - The dashboard sends a strict Content-Security-Policy and loads nothing from third parties.
 - Keep host-specific wiring (proxy labels, networks, paths) out of this repository.
+
+### Two-site pilots and merge attenuation
+
+Set `--min-sites 2 --min-deltas 2` to require contributions from two distinct sites.
+The site minimum is not bypassed by the round timeout; multiple deltas from one
+site do not satisfy it. Give every site its own registration, work directory,
+checkpoint state and seed, and keep private held-out rows excluded from both.
+
+Validator version 3 divides weighted delta sums by the site budgets before
+staleness and borderline penalties. A singleton with weight factor 0.5 therefore
+applies half its update; two equally stale sites also retain the attenuation.
+The normalizer is persisted with the merge plan for deterministic crash replay.
+An already-persisted legacy plan retains its original normalization so retrying
+it cannot silently change the published bytes. The held-out merge gate still
+runs before every publication. Upgrading the validator causes old held and
+quarantined contributions to be revalidated; it does not override their gates.

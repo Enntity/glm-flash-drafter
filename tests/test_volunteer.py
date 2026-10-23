@@ -359,6 +359,28 @@ class ClientTests(unittest.TestCase):
                                  item("d", 3000.0)], 5, thresholds)
         self.assertEqual(weights, [3000.0, 3000.0, 1000.0, 2000.0, 3000.0])   # a: 2 x median site, split
 
+    def test_merge_penalties_attenuate_single_and_equal_inputs(self):
+        from validator.worker import merge_streamed
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            master = root / "base.safetensors"
+            sha = dl.save_weights(master, {"x": torch.tensor([10.0])}, "fp32", scratch_stamp(), {})
+            delta = write_delta(root / "delta.safetensors", {"x": torch.tensor([2.0])}, sha, {})
+            for lag, factor, count, expected in [(0, 1.0, 1, 8.0), (1, 1.0, 1, 9.0),
+                                                 (2, 1.0, 1, 9.5), (0, 0.5, 1, 9.0),
+                                                 (1, 0.5, 2, 9.5), (0, 0.0, 1, 10.0)]:
+                with self.subTest(lag=lag, factor=factor, count=count):
+                    items = [{"site": str(i), "meta": {"tokens": 1000},
+                              "verdict": {"weight_factor": factor}, "base_version": 5-lag}
+                             for i in range(count)]
+                    weights = merge_weights(items, 5, Thresholds())
+                    normalizer = sum(merge_weights(items, 5, Thresholds(), attenuate=False))
+                    out = root / "out.safetensors"
+                    merge_streamed(master, [(delta, w) for w in weights], out, None, "fp32", {},
+                                   normalizer=normalizer)
+                    self.assertEqual(dl.load_weights(out)[0]["x"].item(), expected)
+
     def test_canary_judge_is_sanity_only(self):   # dogfood: a canary rejected for an 8% public check-set dip
         thresholds = Thresholds()
         base = {"heldout": 5.0, "agentic": 4.0, "heldout.prose": 3.0}
@@ -814,6 +836,20 @@ class FailureInjectionTests(unittest.TestCase):
 
     def received(self, site: ApiClient) -> dict:
         return site.call("GET", "/api/v1/me")
+
+    def test_min_sites_requires_distinct_contributors_even_after_timeout(self):
+        self.validator.min_sites = 2
+        first = self.upload(self.sites[0])
+        second = self.upload(self.sites[0])
+        self.validator.step()
+        self.net.clock.t += self.validator.round_timeout_s + 1
+        self.validator.step()
+        self.assertEqual(self.current()[0], 0)
+        self.assertEqual({self.states()[d][0] for d in (first, second)}, {"accepted"})
+        third = self.upload(self.sites[1])
+        self.validator.step()
+        self.assertEqual(self.current()[0], 1)
+        self.assertEqual({self.states()[d][0] for d in (first, second, third)}, {"merged"})
 
     def test_validator_crash_mid_evaluation_loses_nothing(self):
         first = self.upload(self.sites[0])
