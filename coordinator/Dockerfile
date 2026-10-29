@@ -4,7 +4,7 @@
 FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1
 
 # cryptography: only for DRAFTER_STORAGE=gcs (V4 signed URLs need the service account's RSA key)
-RUN pip install --no-cache-dir "cryptography>=42,<47" \
+RUN pip install --no-cache-dir "cryptography>=50,<51" \
  && useradd --system --uid 10001 --home-dir /data --shell /usr/sbin/nologin drafter \
  && mkdir -p /data && chown drafter:drafter /data
 

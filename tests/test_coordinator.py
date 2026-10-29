@@ -721,8 +721,8 @@ class ReviewRegressionTests(unittest.TestCase):
         dockerfile = (_common.REPO / "coordinator" / "Dockerfile").read_text()
         self.assertRegex(dockerfile, r"(?m)^FROM python:[\w.-]+@sha256:[0-9a-f]{64}$")
         pyproject = (_common.REPO / "pyproject.toml").read_text()
-        self.assertIn('"cryptography>=42,<47"', pyproject)   # same range as the image
-        self.assertIn('"cryptography>=42,<47"', dockerfile)
+        self.assertIn('"cryptography>=50,<51"', pyproject)   # same range as the image
+        self.assertIn('"cryptography>=50,<51"', dockerfile)
 
 
 class GcsUploadTests(unittest.TestCase):

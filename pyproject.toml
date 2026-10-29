@@ -15,7 +15,7 @@ dependencies = [
     "safetensors",
     "torch>=2.11,<2.13",  # tested on 2.11.0; 2.13 breaks compiled flex attention on CPU
     "transformers>=4.56",
-    "cryptography>=42,<47",   # ed25519 signatures on published globals (and GCS signed URLs on the coordinator)
+    "cryptography>=50,<51",   # ed25519 signatures on published globals (and GCS signed URLs on the coordinator)
     # Also required: vllm-project/speculators (Apache-2.0) at 824125a36600b5af8fdd1b18286da51ed60f60a8, the
     # revision every result in docs/results.md was produced with.  It cannot be listed here as a git URL (its
     # source build points hs-connectors at a path pip deletes); install it with scripts/install_speculators.sh.
