@@ -45,7 +45,12 @@ before step 0):
   the 16th candidate, a pick serving cannot make). Experimental.
 - `selector_prefix`: each slot weighted by the detached probability that the
   served selector path survives the earlier slots; optional differentiable
-  expected-accepted-length term (`--eal-weight`). Experimental.
+  expected-accepted-length term (`--eal-weight`); `--selector-edge` trains the
+  selector's transition term at the weight serving uses. Trained global v80.
+
+`--unary-loss` takes any Speculators loss or a JSON mix. `ce` trains on the
+target's argmax, the token greedy serving needs among the candidates; `kl_div`
+and `nla` match the target's whole distribution.
 
 A selector-only study on the round-2a weights found that with the body frozen
 no selector objective gains more than about +0.02 accepted tokens per block on
@@ -91,6 +96,15 @@ selector accuracy, losses, and per-depth conditional acceptance
 The proxy tracks Atlas tok/step in direction but not in level: Atlas also
 applies a confidence-based verify-width policy, and engine survival counts
 verifies the policy did not attempt. Check in the engine (`scripts/atlas_check.py`).
+
+`--eval-served` adds what serving does to the chain (`enntity_drafter/served.py`)
+without another forward pass, per edge weight `e` of 0.6, 0.8 and 1.0: the chain
+scored as `unary + e * transition` among the real unary top-16, with no injected
+target (`served_e06_eal`), then under the width rule, which verifies a draft only
+while its calibrated survival stays above a row's price of 0.3 tokens
+(`served_e06_tok_step`, `served_e06_rows`, and `served_e06_value`, tokens less
+the price of the rows). The rule's table is fitted on the blocks it scores, so
+these show what a drafter's confidence can buy, not one serving session.
 
 ## Parallelism and safety
 

@@ -5,6 +5,9 @@ This project is licensed under the Apache License, Version 2.0 (see LICENSE).
 Portions of enntity_drafter/fastpath.py and enntity_drafter/objectives.py are
 derived from vllm-project/speculators (Apache-2.0).
 
+The confidence bin edges in enntity_drafter/served.py are from knapcio's measured
+table (https://github.com/knapcio/GLM-5.3-Flash-4x-DGX-Spark-TP4, MIT).
+
 Third-party software and models used by this project
 -----------------------------------------------------
 

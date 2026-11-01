@@ -11,7 +11,8 @@
 * an interrupted mid-round run (int8, momentum) resumes exactly; two single-process sites exchanging through a
   directory produce bitwise the same weights as the 2-rank process-group run;
 * external transport (volunteer sites): one round per run, starting from a weights file; a mid-round resume
-  writes the same delta, and a resume with other start weights is refused.
+  writes the same delta, a resume with other start weights is refused, and --abandon-partial-round restarts
+  the round from them (optimizer state and data position kept).
 """
 
 from __future__ import annotations
@@ -293,7 +294,8 @@ class TrainerTests(unittest.TestCase, Fixture):
             self.assertTrue(torch.allclose(a[key], value - local[key], atol=0, rtol=0))
         self.assertFalse((resumed / "deltas" / "step-0000008.safetensors").exists())   # one round per run
         other = self.root / "ext-other.safetensors"
-        dl.save_weights(other, {k: v + 1e-3 for k, v in params.items()}, "fp32", scratch_stamp(), {"version": 1})
+        other_sha = dl.save_weights(other, {k: v + 1e-3 for k, v in params.items()}, "fp32", scratch_stamp(),
+                                    {"version": 1})
         interrupted = self.root / "ext-interrupted"
         self.run_cmd(self.train_cmd(interrupted, *common, ranks=1))   # round 0: steps 0-4
         self.run_cmd(self.train_cmd(interrupted, *common, "--checkpoint-every", "2", "--stop-after", "6", ranks=1))
@@ -301,6 +303,36 @@ class TrainerTests(unittest.TestCase, Fixture):
         argv[argv.index(str(base))] = str(other)
         with self.assertRaisesRegex(AssertionError, "not the weights this round started from"):
             self.run_cmd(argv)
+        # an abandoned round (drafter-join --restart-cycle): its steps are dropped, the round restarts at step 4 from
+        # the new weights, and the optimizer state and the data position (6 steps consumed) are kept
+        partial = checkpoint(interrupted, 6)["counters"]
+        self.run_cmd([*argv, "--abandon-partial-round"])
+        self.assertFalse((interrupted / "checkpoints" / "step-0000006").exists())
+        delta_path = interrupted / "deltas" / "step-0000008.safetensors"
+        meta = dl.file_metadata(delta_path, "delta")
+        self.assertEqual((meta["step_start"], meta["step_end"], meta["base"]["sha256"]),
+                         (4, 8, other_sha))
+        done = checkpoint(interrupted, 8)
+        per_step = partial["items_done"] // 6
+        self.assertEqual(done["counters"]["items_done"], partial["items_done"] + 4 * per_step)
+        self.assertAlmostEqual(meta["tokens"], done["counters"]["tokens_seen"] - partial["tokens_seen"])
+        delta = guarded_load_file(delta_path, "drafter")
+        others = dl.load_weights(other)[0]
+        for key, value in others.items():
+            self.assertTrue(torch.allclose(delta[key], value - done["params"][key], atol=0, rtol=0))
+        self.assertEqual(records(interrupted, "round_abandoned")[-1]["step"], 6)
+        # abandoned in the first round there is no earlier step to fall back on: the new weights must still load
+        first = self.root / "ext-first"
+        self.run_cmd(self.train_cmd(first, *common, "--checkpoint-every", "2", "--stop-after", "2", ranks=1))
+        argv = self.train_cmd(first, *common, ranks=1)
+        argv[argv.index(str(base))] = str(other)
+        self.run_cmd([*argv, "--abandon-partial-round"])
+        meta = dl.file_metadata(first / "deltas" / "step-0000004.safetensors", "delta")
+        self.assertEqual((meta["step_start"], meta["base"]["sha256"]), (0, other_sha))
+        delta = guarded_load_file(first / "deltas" / "step-0000004.safetensors", "drafter")
+        done = checkpoint(first, 4)
+        for key, value in others.items():
+            self.assertTrue(torch.allclose(delta[key], value - done["params"][key], atol=0, rtol=0))
 
 
 if __name__ == "__main__":
