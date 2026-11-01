@@ -9,8 +9,9 @@
 * a 2-rank data-parallel (gloo) run of the tiny config on a deterministic synthetic
   pattern improves both loss and the held-out chain proxy, exports a verified
   Atlas BF16 checkpoint, and an interrupted+resumed run matches it exactly;
-* the selector_prefix objective learns; Atlas capture chunks pack into rows;
-  FP8 feature rows round-trip.
+* the selector_prefix objective learns, also on hard targets (``ce``) and at a serving edge weight;
+  ``--eval-served`` reports the chain at each edge and leaves every other metric alone;
+  Atlas capture chunks pack into rows; FP8 feature rows round-trip.
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ import torch  # noqa: E402
 from enntity_drafter import data as sd  # noqa: E402
 from enntity_drafter import guard as incoai_guard  # noqa: E402
 from enntity_drafter import model as sm  # noqa: E402
+from enntity_drafter.train import drop_checkpoints_after  # noqa: E402
 from enntity_drafter.guard import (  # noqa: E402
     SCRATCH_STAMP_KEY, ForbiddenCheckpointError, check_path, check_target_dir, guarded_load_file,
     guarded_torch_load, scratch_stamp,
@@ -492,6 +494,54 @@ print(json.dumps({"rss_growth": after - before, "peak_growth": peak - peak_befor
         print(f"\nselector_prefix (1 rank, 200 steps): eal {start['eal']:.4f} -> {end['eal']:.4f}, "
               f"held-out upstream loss {start['loss']:.4f} -> {end['loss']:.4f}")
         self.assertGreater(end["eal"], start["eal"] + 1.0)
+
+    def test_selector_prefix_learns_on_hard_targets_at_a_serving_edge(self):
+        output = self.root / "prefix-ce-edge"
+        self.run_cmd(self.train_cmd(output, "--steps", "200", "--eval-every", "100", "--checkpoint-every", "200",
+                                    "--objective", "selector_prefix", "--unary-loss", "ce", "--selector-edge", "0.6",
+                                    "--eval-served", ranks=1))
+        start, end = first_eval(output / "train.jsonl"), last_eval(output / "train.jsonl")
+        print(f"\nce at edge 0.6 (1 rank, 200 steps): served e06 eal {start['served_e06_eal']:.4f} -> "
+              f"{end['served_e06_eal']:.4f}")
+        self.assertGreater(end["served_e06_eal"], start["served_e06_eal"] + 1.0)
+
+    def test_dropping_an_abandoned_round_works_on_every_rank_filesystem(self):
+        output = self.root / "drop"
+        for step in (4, 6):
+            (output / "checkpoints" / f"step-{step:07d}").mkdir(parents=True)
+        (output / "checkpoints" / "step-0000004" / "rank1.pt").touch()
+        (output / "checkpoints" / "latest-rank1").write_text("step-0000006")
+        drop_checkpoints_after(output, 4, rank=1, world=1)
+        self.assertFalse((output / "checkpoints" / "step-0000006").exists())
+        self.assertEqual((output / "checkpoints" / "latest-rank1").read_text(), "step-0000004")
+
+    def test_selector_edge_needs_selector_prefix(self):
+        with self.assertRaisesRegex(AssertionError, "--selector-edge needs the selector_prefix objective"):
+            self.run_cmd(self.train_cmd(self.root / "edge-refused", "--selector-edge", "0.6", ranks=1))
+
+    def test_eval_served_adds_metrics_and_changes_nothing_else(self):
+        plain, served = self.root / "eval-plain", self.root / "eval-served"
+        common = ("--eval-only", "--eval-every", "1")
+        self.run_cmd(self.train_cmd(plain, *common, ranks=1))
+        self.run_cmd(self.train_cmd(served, *common, "--eval-served", ranks=1))
+        before, after = last_eval(plain / "train.jsonl"), last_eval(served / "train.jsonl")
+        extra = {k: v for k, v in after.items() if k.startswith("served_")}
+        drafts = sm.load_config(TINY)["block_size"] - 1
+        self.assertEqual({k: v for k, v in after.items() if k in before}, before)
+        self.assertEqual(sorted(extra), sorted(f"served_e{edge}_{key}" for edge in ("06", "08", "10")
+                                               for key in ("eal", "rows", "tok_step", "value")))
+        for edge in ("06", "08", "10"):
+            self.assertLessEqual(extra[f"served_e{edge}_tok_step"], extra[f"served_e{edge}_eal"])
+            self.assertLessEqual(extra[f"served_e{edge}_rows"], drafts)
+
+    def test_eval_served_two_ranks_match_one(self):
+        one, two = self.root / "served-one", self.root / "served-two"
+        common = ("--eval-only", "--eval-every", "1", "--eval-served")
+        self.run_cmd(self.train_cmd(one, *common, ranks=1))
+        self.run_cmd(self.train_cmd(two, *common, ranks=2))
+        a, b = last_eval(one / "train.jsonl"), last_eval(two / "train.jsonl")
+        for key in (k for k in a if k.startswith("served_")):
+            self.assertAlmostEqual(a[key], b[key], places=9, msg=key)
 
 
 if __name__ == "__main__":

@@ -470,7 +470,7 @@ class Site:
                 str(self.opts.teacher), *cycle["data"], "--output", str(out), "--sync-mode", "diloco",
                 "--diloco-transport", "external", "--start-weights", cycle["base"]["path"], "--inner-steps", str(inner),
                 "--steps", str(steps), "--eval-every", "0", "--checkpoint-every", str(max(1, inner // 5)),
-                "--keep-checkpoints", "2", "--delta-out", str(delta),
+                "--keep-checkpoints", "2", "--abandon-partial-round", "--delta-out", str(delta),
                 "--delta-dtype", str(training.get("delta_dtype", "int8")), "--seed", str(seed),
                 "--delta-meta", json.dumps({"client_id": cycle["client_id"], "canary": canary}), "--log-every", "10"]
         network = {f"--{k.replace('_', '-')}": str(kind(training[k])) for k, kind in TRAINING_KEYS.items()

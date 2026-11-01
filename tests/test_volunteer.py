@@ -522,6 +522,7 @@ class ClientTests(unittest.TestCase):
             self.assertNotIn("--grad-accum", argv)                       # ... and the trainer derives grad_accum
             self.assertLess(argv.index("--anchors"), argv.index("--anchors=256"))   # the local flag wins
             self.assertIn("--probe", argv)   # on every start and resume, whatever local guards are given
+            self.assertIn("--abandon-partial-round", argv)   # dogfood: a round stopped mid-way and then restarted
             self.assertEqual(argv[argv.index("--probe-headroom-gb") + 1], "4")
             self.assertEqual([a for a in argv if a.startswith("--min-free-gb")], ["--min-free-gb=8"])
             warnings = [l for l in out.getvalue().splitlines() if "overrides the network" in l]

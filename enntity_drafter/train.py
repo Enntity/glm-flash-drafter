@@ -62,6 +62,7 @@ from .export import export_engine_checkpoint, verify_export
 from .guard import guarded_torch_load, scratch_stamp, sha256_file
 from .model import install_fixed_anchor_mask
 from .objectives import OBJECTIVES, loss_kwargs, training_loss
+from .served import EDGES, Tally
 
 TRAINER_VERSION = "scratch-v1"   # provenance field; unchanged so existing checkpoints stay loadable
 #: ``--cpu-autocast`` (tests): bf16 autocast on CPU too, to emulate the CUDA numerics.
@@ -601,23 +602,51 @@ def depth_counts_recorded():
         dflash2_metrics.compute_accepted_length_counts = original
 
 
+@contextlib.contextmanager
+def backbone_recorded(model: nn.Module, recording: bool):
+    """Keep what ``_backbone_forward`` returns during the model call, so ``--eval-served`` adds no forward pass."""
+
+    recorded: list[tuple[torch.Tensor, ...]] = []
+    if not recording:
+        yield recorded
+        return
+    original = model._backbone_forward
+
+    def wrapper(*args: Any, **kwargs: Any) -> tuple[torch.Tensor, ...]:
+        recorded.append(original(*args, **kwargs))
+        return recorded[-1]
+
+    model._backbone_forward = wrapper
+    try:
+        yield recorded
+    finally:
+        del model._backbone_forward
+
+
 @torch.no_grad()
 def evaluate(model: nn.Module, samples, kwargs: dict[str, Any], device: torch.device,
-             dtype: torch.dtype, world: int = 1, bucket_of=None) -> dict[str, Any]:
+             dtype: torch.dtype, world: int = 1, bucket_of=None,
+             served_edges: tuple[float, ...] = ()) -> dict[str, Any]:
     """Held-out chain proxy: teacher-forced greedy selector prefix + bonus.
 
     Each rank evaluates its share of the rows (fixed anchors); the metric
     sums are added over ranks in rank order, so the result is independent of
     the split.  ``bucket_of(row name)`` (optional) also reports the same
-    metrics per bucket (e.g. per category) under ``buckets``.
+    metrics per bucket (e.g. per category) under ``buckets``.  ``served_edges``
+    (``--eval-served``) adds the ``served_*`` metrics of :mod:`.served`, over all buckets.
     """
 
     was_training = model.training
     model.eval()
     parts: dict[str, list[Any]] = {}   # bucket -> [rows, totals]
+    tally = Tally(served_edges)
     for name, inputs, chosen in samples:
-        with fixed_anchors_installed(model, chosen), autocast(device), depth_counts_recorded() as depth:
-            _, loss, metrics = model(**to_device(inputs, device, dtype), max_anchors=len(chosen), **kwargs)
+        batch = to_device(inputs, device, dtype)
+        with fixed_anchors_installed(model, chosen), autocast(device), depth_counts_recorded() as depth, \
+                backbone_recorded(model, bool(served_edges)) as backbone:
+            _, loss, metrics = model(**batch, max_anchors=len(chosen), **kwargs)
+            for output in backbone:
+                tally.score(model, batch["input_ids"], output)
         if not torch.isfinite(loss):
             raise FloatingPointError(f"non-finite eval loss on {name}")
         entry = parts.setdefault(str(bucket_of(name)) if bucket_of else "", [0, {}])
@@ -640,12 +669,16 @@ def evaluate(model: nn.Module, samples, kwargs: dict[str, Any], device: torch.de
                 entry[0] += part_rows
                 for key, value in part_totals.items():
                     entry[1][key] = entry[1].get(key, 0.0) + value
+        if served_edges:
+            tallies: list[Any] = [None] * world
+            dist.all_gather_object(tallies, tally)
+            tally = Tally.merged(tallies)
     rows, totals = 0, {}
     for part_rows, part_totals in parts.values():
         rows += part_rows
         for key, value in part_totals.items():
             totals[key] = totals.get(key, 0.0) + value
-    result = summarize_eval(rows, totals, model.candidate_selector.top_k)
+    result = {**summarize_eval(rows, totals, model.candidate_selector.top_k), **tally.summary()}
     if bucket_of:
         result["buckets"] = {bucket: summarize_eval(part_rows, part_totals, model.candidate_selector.top_k)
                              for bucket, (part_rows, part_totals) in sorted(parts.items())}
@@ -798,6 +831,24 @@ def load_checkpoint(output: Path, model: nn.Module, optimizer: torch.optim.Optim
     del payload
     release_host_memory()
     return step, counters
+
+
+def drop_checkpoints_after(output: Path, step: int, rank: int, world: int) -> None:
+    """Remove an abandoned round's checkpoints (after ``step``), so ``--keep-checkpoints`` never prunes the new
+    round's; each rank's pointer moves to ``step``'s checkpoint, or goes (a resume before the next one starts over)."""
+
+    root = output / "checkpoints"
+    barrier(world)
+    for stale in root.glob("step-*"):   # every rank: hosts may not share a filesystem (ranks that do may race: harmless)
+        number = stale.name[len("step-"):]
+        if number.isdigit() and int(number) > step:
+            shutil.rmtree(stale, ignore_errors=True)
+    barrier(world)
+    pointer, kept = root / f"latest-rank{rank}", root / f"step-{step:07d}"
+    if (kept / f"rank{rank}.pt").is_file():
+        pointer.write_text(kept.name)
+    else:
+        pointer.unlink(missing_ok=True)
 
 
 @torch.no_grad()
@@ -1001,6 +1052,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="initialize the body from a weights file (enntity.drafter.weights/v1 safetensors, e.g. a "
                         "coordinator's global weights; scratch stamp required); with --diloco-transport external "
                         "every round starts from it")
+    p.add_argument("--abandon-partial-round", action="store_true",
+                   help="--diloco-transport external: a mid-round checkpoint from other start weights (a round that "
+                        "was given up, drafter-join --restart-cycle) restarts that round from --start-weights at its "
+                        "first step, keeping the optimizer state and the data position (default: refuse)")
+    p.add_argument("--eval-served", action="store_true",
+                   help="also report the served_* metrics of enntity_drafter/served.py: the chain at each edge weight, "
+                        "among the real candidates, under the serving width rule")
     p.add_argument("--eval-only", action="store_true",
                    help="evaluate the initial body (--start-weights / --init-from) on the held-out set and exit")
     p.add_argument("--agreement-mask", default="off",
@@ -1092,6 +1150,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--dpace-alpha", type=float, default=0.5)
     p.add_argument("--prefix-floor", type=float, default=0.1)
     p.add_argument("--eal-weight", type=float, default=0.0)
+    p.add_argument("--selector-edge", type=float, default=1.0,
+                   help="selector_prefix: train the selector's transition term at this weight, as serving scores it "
+                        "(enntity_drafter/served.py)")
     p.add_argument("--eval-every", type=int, default=1000, help="0 = no held-out evaluation")
     p.add_argument("--eval-anchors", type=int, default=128)
     p.add_argument("--eval-rows", type=int, default=0, help="0 = all held-out rows")
@@ -1137,6 +1198,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.warmup = max(1, args.steps // 10)
     if args.late_objective and args.late_objective_step is None:
         p.error("--late-objective needs --late-objective-step")
+    if args.selector_edge != 1.0 and "selector_prefix" not in (args.objective, args.late_objective):
+        p.error("--selector-edge needs the selector_prefix objective")
     if args.capture_index and args.capture_root is None:
         p.error("--capture-index needs --capture-root")
     if args.agreement_mask != "off" and not (args.agreement_mask == "argmax"
@@ -1285,17 +1348,25 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         if start_step:
             diloco.load_state_dict(resumed["diloco"])
         if external:
-            if start_step % args.inner_steps == 0:   # a new round starts from the coordinator's weights
-                if start_step:
+            partial, abandoned = start_step % args.inner_steps, False
+            if partial and diloco.base.get("sha256") != start_record["sha256"]:
+                if not args.abandon_partial_round:
+                    raise RuntimeError("resume mid-round: --start-weights is not the weights this round started from")
+                # the round was given up: it restarts at its first step; optimizer state and data position are kept
+                emit({"phase": "round_abandoned", "step": start_step, "restart_step": start_step - partial})
+                start_step, partial, abandoned = start_step - partial, 0, True
+                counters["round_start_tokens"] = counters.get("tokens_seen", 0.0)
+                drop_checkpoints_after(output, start_step, rank, world)
+            if not partial:   # a new round starts from the coordinator's weights
+                if start_step or abandoned:
                     load_start_weights(args.start_weights, owned)
                 diloco.set_global(dict(owned), start_record)
-            elif diloco.base.get("sha256") != start_record["sha256"]:
-                raise RuntimeError("resume mid-round: --start-weights is not the weights this round started from")
     if master is not None:
         master.sync_low()
     kwargs = loss_kwargs(device.type, args.unary_loss, args.per_position, args.gamma,
                          args.selector_alpha, args.dpace_alpha)
-    selector_prefix = {"floor": args.prefix_floor, "eal_weight": args.eal_weight}
+    selector_prefix = {"floor": args.prefix_floor, "eal_weight": args.eal_weight, "edge": args.selector_edge}
+    served_edges = EDGES if args.eval_served else ()
     if not args.eval_only:   # before the stream: its items depend on the micro-batch
         select_batch(args, counters if start_step else {}, model, cfg, device, compute_dtype, kwargs,
                      selector_prefix, optimizer, world, emit, start_step, capture is not None)
@@ -1319,7 +1390,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
                 if not rows:
                     continue
                 metrics = evaluate(model, capture_eval_samples(capture, rows, args, rank, world), kwargs, device,
-                                   compute_dtype, world, bucket_of)
+                                   compute_dtype, world, bucket_of, served_edges)
                 buckets = metrics.pop("buckets", {})
                 record.update(metrics if name == first_group else {f"{name}/{k}": v for k, v in metrics.items()})
                 if len(buckets) > 1:
@@ -1334,7 +1405,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
 
         def run_eval() -> dict[str, Any]:
             return evaluate(model, rowstore_eval_samples(store, heldout_rows, args, model.block_size, rank, world),
-                            kwargs, device, compute_dtype, world)
+                            kwargs, device, compute_dtype, world, served_edges=served_edges)
     if args.eval_only:
         record = {"phase": "eval", "step": 0, "tokens_seen": 0, **run_eval()}
         emit(record)

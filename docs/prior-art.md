@@ -52,6 +52,9 @@ project pages; check them for the current paper versions.
   recipe for two DGX Sparks with Atlas.
 - **RigMark.** https://github.com/alexellis/rigmark (MIT): decode benchmark
   used for some results.
+- **GLM-5.3-Flash-4x-DGX-Spark-TP4.** https://github.com/knapcio/GLM-5.3-Flash-4x-DGX-Spark-TP4
+  (MIT): draft-shape truncation from selector confidence, the rule
+  `enntity_drafter/served.py` replays, and its confidence bin edges.
 
 ## Low-communication distributed training
 

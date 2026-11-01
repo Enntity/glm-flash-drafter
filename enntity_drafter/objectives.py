@@ -22,7 +22,7 @@
     ``upstream`` with the selector CE restricted to slots whose target is already in the unary top-K: upstream
     injects an absent target as the K-th candidate, a choice serving can never make.  Unary term unchanged.
 
-``selector_prefix`` and ``selector_inset`` are experimental: no published round used them.
+``selector_prefix`` trained published global v80. ``selector_inset`` is experimental: no published round used it.
 """
 
 from __future__ import annotations
@@ -32,6 +32,8 @@ from typing import Any
 
 import torch
 from torch.nn import functional as F
+
+from .served import edge_scores
 
 OBJECTIVES = ("upstream", "selector_prefix", "selector_inset")
 
@@ -111,7 +113,7 @@ def upstream_loss_light(model: Any, inputs: dict[str, torch.Tensor], *, max_anch
 
 def selector_prefix_loss(model: Any, inputs: dict[str, torch.Tensor], *, max_anchors: int,
                          loss_config: dict[str, Any], selector_alpha: float = 1.0,
-                         floor: float = 0.1, eal_weight: float = 0.0,
+                         floor: float = 0.1, eal_weight: float = 0.0, edge: float = 1.0,
                          **_ignored: Any) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     from speculators.models.dflash2.metrics import selector_training_candidates
 
@@ -126,7 +128,7 @@ def selector_prefix_loss(model: Any, inputs: dict[str, torch.Tensor], *, max_anc
     target_ids = targets.argmax(-1)
     candidates = unary.topk(top_k, dim=-1).indices
     training_ids, target_pos, contains = selector_training_candidates(candidates, target_ids)
-    scores = model.candidate_selector.score_candidates(unary, hidden, predecessors, training_ids)
+    scores = edge_scores(model.candidate_selector, unary, hidden, predecessors, training_ids, edge)
 
     # Per-position unary term from the configured Speculators loss(es).
     unary_terms = sum(weight * fn(unary, targets) for fn, weight in loss_config.values())  # [1,T]
