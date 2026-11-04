@@ -54,6 +54,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from .checkpoint_io import WrittenBack
 from . import capture_io as cd
 from . import diloco as dl
 from . import fastpath as fp
@@ -723,43 +724,12 @@ def release_host_memory() -> None:
             pass
 
 
-class WrittenBack:
-    """A write-only file for ``torch.save`` that writes back and drops what it wrote every ``chunk`` bytes: a
-    checkpoint is many GB of dirty page cache otherwise, which MemAvailable does not count as free until the kernel
-    has written it (GB10: the same memory the GPU uses)."""
-
-    chunk = 256 * 2**20
-
-    def __init__(self, path: Path):
-        self.stream, self.written, self.synced = open(path, "wb"), 0, 0
-
-    def write(self, data) -> int:
-        self.stream.write(data)
-        self.written += len(data)
-        if self.written - self.synced >= self.chunk:
-            self.sync()
-        return len(data)
-
-    def flush(self) -> None:
-        self.stream.flush()
-
-    def sync(self) -> None:
-        self.stream.flush()
-        os.fsync(self.stream.fileno())
-        if hasattr(os, "posix_fadvise"):
-            os.posix_fadvise(self.stream.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
-        self.synced = self.written
-
-    def close(self) -> None:
-        self.sync()
-        self.stream.close()
-
 
 def save_checkpoint(output: Path, step: int, model: nn.Module, optimizer: torch.optim.Optimizer,
                     rank: int, world: int, provenance: dict[str, Any],
                     counters: dict[str, float] | None = None,
                     named: list[tuple[str, torch.Tensor]] | None = None, keep: int = 0,
-                    extra: dict[str, Any] | None = None) -> Path:
+                    extra: dict[str, Any] | None = None, min_disk_free_gb: float = 16.0) -> Path:
     """``named``: the fp32 tensors the optimizer owns (default: the model's trainable parameters).
     ``keep``: afterwards delete all but the ``keep`` newest ``step-*`` directories on this host.
     ``extra``: more payload entries (``diloco``: global weights, outer momentum, round)."""
@@ -785,11 +755,15 @@ def save_checkpoint(output: Path, step: int, model: nn.Module, optimizer: torch.
         "optimizer": optimizer.state_dict(), **(extra or {}),
     }
     temporary = directory / f"rank{rank}.pt.tmp"
-    stream = WrittenBack(temporary)
     try:
-        torch.save(payload, stream)
-    finally:
-        stream.close()
+        stream = WrittenBack(temporary, min_free_bytes=int(min_disk_free_gb * 2**30))
+        try:
+            torch.save(payload, stream)
+        finally:
+            stream.close()
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
     del payload
     os.replace(temporary, directory / f"rank{rank}.pt")
     release_host_memory()
@@ -1180,6 +1154,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--eval-points", type=int, default=0,
                    help="with --time-budget-h: evaluate this many times over the run (eval_every = steps/N)")
     p.add_argument("--checkpoint-points", type=int, default=10)
+    p.add_argument("--min-disk-free-gb", type=float, default=16.0,
+                   help="leave this much disk space during checkpoint writes (GiB; default 16)")
     p.add_argument("--keep-checkpoints", type=int, default=0,
                    help="keep only this many newest checkpoints per rank (0 = all)")
     p.add_argument("--empty-cache-every", type=int, default=0,
@@ -1194,6 +1170,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--peak-tflops", type=float, default=None,
                    help="measured dense BF16 matmul ceiling of one GPU (logs mfu = achieved / this)")
     args = p.parse_args(argv)
+    if not math.isfinite(args.min_disk_free_gb) or args.min_disk_free_gb < 0:
+        p.error("--min-disk-free-gb must be finite and nonnegative")
     if args.warmup >= args.steps:
         args.warmup = max(1, args.steps // 10)
     if args.late_objective and args.late_objective_step is None:
@@ -1477,7 +1455,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
                          **({"round_start_tokens": round_start_tokens} if diloco is not None else {}),
                          **({"planned_steps": args.steps} if args.time_budget_h is not None else {}),
                          **({"cap_switch_item": cap_switch} if cap_switch is not None else {})}, owned,
-                        keep=args.keep_checkpoints,
+                        keep=args.keep_checkpoints, min_disk_free_gb=args.min_disk_free_gb,
                         extra={"diloco": diloco.state_dict()} if diloco is not None else None)
 
     def low_memory(completed: int, free: float, peak: float) -> None:
