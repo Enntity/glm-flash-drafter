@@ -238,3 +238,12 @@ Round 2a's continuation used `--init-from <round-1 checkpoint> --lr 3e-4
 must be the GLM-5.3-Flash target directory (`model.safetensors.index.json`,
 `config.json`); `--teacher` is checked for a drafter-shaped or
 non-commercial-licensed directory and refused if so.
+
+Checkpoint writes preserve 16 GiB of free space by default (`--min-disk-free-gb`).
+The writer checks the output filesystem before opening a temporary checkpoint and
+before each write, including the size about to be written. If space drops below
+that margin, training fails with a disk-headroom error, removes the partial file,
+and keeps the previous checkpoint and resume pointer. `--keep-checkpoints` still
+controls retention after a successful save; budget space for that retained set
+plus the next checkpoint. The guard does not reserve space against other writers
+or replace filesystem quotas.
