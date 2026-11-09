@@ -46,7 +46,8 @@ before step 0):
 - `selector_prefix`: each slot weighted by the detached probability that the
   served selector path survives the earlier slots; optional differentiable
   expected-accepted-length term (`--eal-weight`); `--selector-edge` trains the
-  selector's transition term at the weight serving uses. Trained global v80.
+  selector's transition term at the weight serving uses. Trained globals v80
+  and v81 (with `--unary-loss nla --eal-weight 1.0`).
 
 `--unary-loss` takes any Speculators loss or a JSON mix. `ce` trains on the
 target's argmax, the token greedy serving needs among the candidates; `kl_div`

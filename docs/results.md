@@ -7,6 +7,100 @@ copy drafts on as in production); arms differ only in `--draft-model`. Visits
 ran in ABBA order (scratch, DFlash2, DFlash2, scratch), and both visits of an
 arm gave identical tok/step. Rounds 1-2b are single training runs.
 
+## Rounds 3-4: v79 to v81 (current)
+
+Rounds 3 and 4 train with direct two-node plain averaging (DiLoCo, 200 inner
+steps, outer lr 1, no momentum), each continuing from the previous global.
+Every version is still a descendant of the round-1 fresh initialization.
+
+| version | date | what changed | result |
+|---|---|---|---|
+| v79 | 2026-10-31 | 1,358 rows from 75 agentic sessions new to training, 2,400 steps | held-out agentic `eal` 3.644 to 3.707, structured 5.495 to 5.611, code 4.077 to 4.142; the offline gain only partly reached live speed |
+| v80 | 2026-11-01 | `selector_prefix` objective with `nla` unary loss and an `eal` term | held-out `eal` +1.1-1.6% on all groups but agentic; live tok/step up (structured +5.7%) but tok/s mostly flat |
+| v81 | 2026-11-05 | one-epoch schedule from v80 on 76,427 rows, stopped at step 13,200 | first clear live gain over v80: +2-6% tok/s on code and structured (table below) |
+
+Why agentic stalled before v79: the agentic training rows came from only 22
+sessions and the held-out rows from others, so the model memorized those
+sessions (training-row `eal` rose while held-out fell). New sessions teach
+more than more turns of known ones.
+
+What round 4 settled before v81: selector edge weight (0.6 vs 1.0), `ce` vs
+`nla` unary loss and their mix all measured the same; short A/Bs started from
+an annealed checkpoint cannot rank recipes, because the re-warm swamps the
+difference. An overfit probe fits seen held-out rows past DFlash2 within 100
+steps, so the wall is generalization, not capacity: the lever is more and more
+varied teacher text. A 1% data increase moved nothing live; v81's full
+one-epoch pass over the grown pool did.
+
+### v81 data
+
+76,427 captured rows (75,957 train, 470 held-out), 119.0M stored tokens, 71.0M
+anchor positions:
+
+| source | rows | stored tokens (M) |
+|---|---|---|
+| prose coverage (Enntity-authored prompts, GLM-5.3-Flash teacher) | 28,244 | 30.1 |
+| code coverage | 11,775 | 25.1 |
+| structured-output coverage | 15,668 | 20.8 |
+| template prompts | 3,782 | 4.7 |
+| Enntity-internal chat | 3,262 | 8.3 |
+| coding-agent sessions (Enntity-internal, and GLM-5.3-Flash on Enntity-authored tasks) | 13,315 | 29.0 |
+| tool payloads | 381 | 1.0 |
+
+Internal sources are not published; see the README for what that means for
+reproduction.
+
+### v81 training
+
+`--objective selector_prefix --unary-loss nla --eal-weight 1.0`, lr 2.5e-5
+cosine to 0.2x over a 17,000-step one-epoch plan (50 warmup), 4,096 anchors
+per step (512 per micro-batch, 4 accumulation steps, 2 ranks), source weights
+favouring prose (0.29) and code (0.25). Stopped at step 13,200 when held-out
+gains flattened, about 315M supervised tokens.
+
+Held-out `eal` (teacher-forced expected accepted length per 8-token block):
+
+| group | v80 | v81 |
+|---|---|---|
+| agentic (96 rows) | 3.714 | 3.763 |
+| template | 3.240 | 3.282 |
+| structured | 5.672 | 5.816 |
+| prose | 2.510 | 2.569 |
+| code | 4.211 | 4.360 |
+
+### v81 in Atlas (2026-11-05)
+
+Same harness as below. Public probes: v81 and v80 two visits each, DFlash2
+one; tok/step was identical between an arm's visits. Held-out agentic turns:
+one visit per arm. Engine decode tok/s, tok/step in brackets:
+
+| category | v81 | v80 | DFlash2 | v81 / DFlash2 tok/s |
+|---|---|---|---|---|
+| matched prose | 40.9 (2.12) | 40.1 (2.06) | 46.8 (2.50) | 87% |
+| matched code | 63.0 (4.11) | 61.5 (3.99) | 69.2 (4.89) | 91% |
+| structured output | 79.6 (6.01) | 76.9 (5.74) | 87.3 (6.98) | 91% |
+| RigMark prose | 36.0 (1.86) | 35.8 (1.83) | 39.0 (2.04) | 92% |
+| RigMark code | 63.3 (4.27) | 61.8 (4.12) | 66.9 (4.73) | 95% |
+| RigMark structured | 84.2 (6.73) | 79.8 (6.25) | 91.0 (7.64) | 93% |
+| held-out agentic, set A (16 turns) | 51.1 (3.42) | 52.0 (3.46) | 42.0 (2.70) | 122% |
+| held-out agentic, set B (24 turns) | 48.8 (3.17) | 47.6 (3.10) | 42.3 (2.68) | 115% |
+
+Survival by draft depth (share of verify steps accepting at least d drafts):
+
+| category | v81 | DFlash2 |
+|---|---|---|
+| prose | .68 .35 .07 .02 .00 .00 .00 | .74 .46 .18 .07 .02 .01 .00 |
+| code | .87 .71 .50 .37 .25 .16 .11 | .90 .78 .60 .51 .42 .33 .25 |
+
+Exactness: all 32 public exact-match texts were identical across every visit
+and drafter; on held-out agentic turns 39 of 40 matched, the one difference
+coming from the engine's forced end-of-thinking (see Exactness below).
+
+Offline `eal` is not a reliable proxy for live speed (v80's offline gain did
+not reach tok/s), so every release is checked in Atlas, and only tok/s counts.
+
+## Rounds 1-2b
+
 ## Data per round
 
 | round | data | rows | generated tokens | supervised tokens trained |
