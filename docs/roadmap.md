@@ -2,12 +2,11 @@
 
 What is built is marked **done**; everything else is a plan and may change.
 
-## 1. Finish round 2b and check it in Atlas
+## 1. Check every release in Atlas
 
-- Atlas tok/step on the matched and RigMark sets, plus one visit with a fixed
-  verify width (`ATLAS_DFLASH_FIXED_WIDTH=7`) to separate acceptance from the
-  width policy.
-- Report greedy-prefix acceptance per category next to teacher-forced `eal`.
+**done**: rounds 2b to 4 were checked in Atlas for exactness and tok/s against
+the previous version and DFlash2 (fixed-width visit included for round 2b).
+v81 is the current version; see [results.md](results.md).
 
 ## 2. Data scaling
 
@@ -69,6 +68,8 @@ tok/step against the previous one before it is published.
 
 ## 6. Weights
 
-No weights are published yet. Published weights would come from public-only
-data rounds, with the data card, training command, provenance stamp and Atlas
-receipts.
+v79, v80 and v81 are signed network globals; SparkGLM currently ships v80. The inference weights are not public yet. A public release would
+come with the data card, training command, provenance stamp and Atlas
+receipts; weights trained on the internal sources need a decision about those
+sources first, and public-only data rounds remain the path to a fully
+reproducible release.

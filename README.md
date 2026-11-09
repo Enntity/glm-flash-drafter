@@ -1,16 +1,23 @@
 # glm-flash-drafter
 
-An open effort to train a DFlash2-style speculative-decoding drafter for
-[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) from scratch, with
-code, data builders and results that anyone can use, check and extend. The
-drafter targets GB10 / DGX Spark-class hardware served by the
+**A DFlash2 speculative-decoding drafter for
+[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash), trained from
+scratch on 2x DGX Spark.** Fresh random initialization, no third-party drafter
+weights: all 1.17B trained parameters come from Enntity runs on two GB10 nodes. It is specific
+to GLM-5.3-Flash (it reads the target's hidden states and shares its embedding
+and lm_head) and has the DFlash2 shape, so the
 [Atlas](https://github.com/Enntity/atlas) engine (as in
-[SparkGLM](https://github.com/Enntity/sparkglm)).
+[SparkGLM](https://github.com/Enntity/sparkglm)) serves it in place of
+[incoai/GLM-5.3-Flash-DFlash2](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2).
+This repository holds the code, data builders and results, for anyone to use,
+check and extend.
 
-Status: **research, early; outside contributors welcome.** Signed training globals are available to registered
-compute sites; there is no qualified inference-weight release yet. Everything here is
-measured on Enntity's own two-node GB10 setup; numbers are from single runs
-unless stated.
+Status: **research; outside contributors welcome.** The current version is
+**v81** (2026-11-05): 87-95% of DFlash2's decode speed on public prompts and
+115-122% on held-out coding-agent turns. SparkGLM currently ships v80; the
+inference weights are not public yet. Signed training globals are available to
+registered compute sites. Everything here is measured on Enntity's own
+two-node GB10 setup; numbers are from single runs unless stated.
 
 ## Why
 
@@ -41,7 +48,7 @@ Teacher text from hosted endpoints is also subject to each host's terms (see
 [docs/pipeline.md](docs/pipeline.md)). The Atlas engine (AGPL-3.0-only) is only
 used as a separate server process; no engine code is copied here.
 
-## Current results
+## Current results (v81)
 
 The drafter has the DFlash2 shape: 5 non-causal sliding-window layers
 (hidden 4096, 32/8 heads, window 2048), grouped dynamic convolution, a
@@ -50,36 +57,33 @@ target's hidden states at layers 5, 14, 24, 33 and 42, proposing 7 tokens per
 step. 1.17B trained parameters; the embedding and lm_head are the target's,
 frozen.
 
-Atlas accepted tokens per verify step (higher is better; greedy, one request
-at a time, same server and settings for every drafter; both visits per arm
-gave identical tok/step):
+Atlas decode speed on SparkGLM (two GB10 nodes, NVFP4 target, greedy, one
+request at a time, shipped adaptive verify width; every arm on the same server
+and settings, differing only in `--draft-model`; 2026-11-05). Engine tok/s,
+accepted tokens per verify step in brackets:
 
-| category | DFlash2 (incoai) | round 1 | round 2a | round 2b |
-|---|---|---|---|---|
-| matched prose, 12 prompts x 256 tokens | 2.501 | 1.589 | 1.785 | 1.905 |
-| matched code, 12 prompts x 256 tokens | 4.890 | 2.471 | 2.863 | 3.574 |
-| RigMark code | 4.347 | 2.134 | 2.537 | not measured |
-| RigMark prose | 2.044 | 1.404 | 1.573 | not measured |
-| RigMark structured | 7.569 | 2.081 | 2.412 | 4.944 |
+| category | v81 | v80 | v81 vs v80 | DFlash2 (incoai) | v81 / DFlash2 |
+|---|---|---|---|---|---|
+| prose, 12 prompts x 256 tokens | 40.9 (2.12) | 40.1 (2.06) | +1.9% | 46.8 (2.50) | 87% |
+| code, 12 prompts x 256 tokens | 63.0 (4.11) | 61.5 (3.99) | +2.4% | 69.2 (4.89) | 91% |
+| structured output, 4 prompts | 79.6 (6.01) | 76.9 (5.74) | +3.4% | 87.3 (6.98) | 91% |
+| RigMark prose | 36.0 (1.86) | 35.8 (1.83) | +0.6% | 39.0 (2.04) | 92% |
+| RigMark code | 63.3 (4.27) | 61.8 (4.12) | +2.4% | 66.9 (4.73) | 95% |
+| RigMark structured | 84.2 (6.73) | 79.8 (6.25) | +5.6% | 91.0 (7.64) | 93% |
+| held-out coding-agent turns, set A (16) | 51.1 (3.42) | 52.0 (3.46) | -1.6% | 42.0 (2.70) | 122% |
+| held-out coding-agent turns, set B (24) | 48.8 (3.17) | 47.6 (3.10) | +2.4% | 42.3 (2.68) | 115% |
 
-Output text was identical across all drafters on every matched prompt.
-Round 2b reaches 0.73-0.76x of DFlash2's tok/step on matched prose and code
-and 0.65x on RigMark structured output (up from 0.32x in round 2a; decode on
-that row rose from 43 to 71 tok/s). It is not yet a replacement.
+Run-to-run noise is about ±2%. Output text was identical across all drafters
+on every public prompt; on the held-out agentic turns 39 of 40 matched (the
+one difference is the engine's forced end-of-thinking at a token budget, see
+[docs/results.md](docs/results.md)). DFlash2 is still ahead on public prose,
+code and structured output; v81 is ahead on agentic coding traffic like the
+traffic it was trained on.
 
-Round 2b added 23,942 rows of structured-output data (JSON, tool calls,
-configs, code edits, tables) and capped every source at 2 epochs. On the
-trainer's teacher-forced proxy (expected accepted length per block, 1-8):
-
-| held-out group | start (round 2a weights) | end of round 2b |
-|---|---|---|
-| structured (coverage prompts) | 2.75 | 5.55 |
-| template (code, prose, structured, tools) | 2.65 | 3.14 |
-| prose | 2.05 | 2.34 |
-| agentic (internal sessions) | 3.36 | 3.51 |
-
-Prose acceptance still falls off quickly with draft depth, so round 3 adds
-prose and code coverage data. Details, curves and caveats:
+Since round 2b (0.73-0.76x of DFlash2's tok/step on matched prose and code,
+0.65x on RigMark structured), rounds 3 and 4 added fresh agentic sessions,
+prose and code coverage and a served-path objective; v81 is at 0.85x, 0.84x
+and 0.88x. Per-round data, curves and caveats:
 [docs/results.md](docs/results.md).
 
 ## Pipeline
