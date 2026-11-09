@@ -7,17 +7,28 @@ weights: all 1.17B trained parameters come from Enntity runs on two GB10 nodes. 
 to GLM-5.3-Flash (it reads the target's hidden states and shares its embedding
 and lm_head) and has the DFlash2 shape, so the
 [Atlas](https://github.com/Enntity/atlas) engine (as in
-[SparkGLM](https://github.com/Enntity/sparkglm)) serves it in place of
+[SparkGLM](https://github.com/Enntity/sparkglm)) serves it as a drop-in DFlash2
+drafter. Results are measured against the **reference drafter**: the best
+public DFlash2 drafter for GLM-5.3-Flash,
 [incoai/GLM-5.3-Flash-DFlash2](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2).
 This repository holds the code, data builders and results, for anyone to use,
 check and extend.
 
 Status: **research; outside contributors welcome.** The current version is
-**v81** (2026-11-05): 87-95% of DFlash2's decode speed on public prompts and
-115-122% on held-out coding-agent turns. SparkGLM currently ships v80; the
-inference weights are not public yet. Signed training globals are available to
-registered compute sites. Everything here is measured on Enntity's own
-two-node GB10 setup; numbers are from single runs unless stated.
+**v81** (2026-11-05): 87-95% of the reference drafter's decode speed on public prompts and
+115-122% on held-out coding-agent turns. Weights:
+[Enntity/GLM-5.3-Flash-DFlash2-enntity](https://huggingface.co/Enntity/GLM-5.3-Flash-DFlash2-enntity)
+(Apache-2.0, one tag per release). SparkGLM currently ships v80. Signed training
+globals are available to registered compute sites. Everything here is measured
+on Enntity's own two-node GB10 setup; numbers are from single runs unless
+stated.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/rigmark-progress-dark.svg">
+  <img alt="RigMark decode tok/s from no drafter (about 28, estimated) through rounds 1, 2a, 2b, v79, v80 and v81 (structured 84.2, code 63.3, prose 36.0), against the reference drafter (91.0, 66.9, 39.0)" src="docs/img/rigmark-progress-light.svg">
+</picture>
+
+Regenerate with `python scripts/rigmark_progress_chart.py docs/img`.
 
 ## Why
 
@@ -25,14 +36,12 @@ A drafter proposes several tokens per step and the target model verifies them
 in one pass; the output is the target's own (greedy verification). How much
 faster decoding gets depends on how many drafted tokens the target accepts.
 
-The DFlash2 drafter commonly used with GLM-5.3-Flash on this hardware,
-[incoai/GLM-5.3-Flash-DFlash2](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2),
-is licensed CC BY-NC-ND 4.0: no commercial use, no derivatives. The method and
+The reference drafter is licensed CC BY-NC-ND 4.0: no commercial use, no derivatives. The method and
 the code are open (DFlash/DFlash2 code is MIT and Apache-2.0, see
 [docs/prior-art.md](docs/prior-art.md)), and the target model is MIT. Training
 new weights from a fresh initialization, on data we are allowed to use, gives
-a drafter without that restriction. This repository contains no incoai
-weights, configs, tokenizer files or text, and `enntity_drafter/guard.py`
+a drafter without that restriction. This repository contains none of the
+reference drafter's weights, configs, tokenizer files or text, and `enntity_drafter/guard.py`
 refuses to load anything that looks like them (by path, provenance files,
 safetensors metadata and known hashes).
 
@@ -62,7 +71,7 @@ request at a time, shipped adaptive verify width; every arm on the same server
 and settings, differing only in `--draft-model`; 2026-11-05). Engine tok/s,
 accepted tokens per verify step in brackets:
 
-| category | v81 | v80 | v81 vs v80 | DFlash2 (incoai) | v81 / DFlash2 |
+| category | v81 | v80 | v81 vs v80 | reference | v81 / reference |
 |---|---|---|---|---|---|
 | prose, 12 prompts x 256 tokens | 40.9 (2.12) | 40.1 (2.06) | +1.9% | 46.8 (2.50) | 87% |
 | code, 12 prompts x 256 tokens | 63.0 (4.11) | 61.5 (3.99) | +2.4% | 69.2 (4.89) | 91% |
@@ -76,13 +85,13 @@ accepted tokens per verify step in brackets:
 Run-to-run noise is about ±2%. Output text was identical across all drafters
 on every public prompt; on the held-out agentic turns 39 of 40 matched (the
 one difference is the engine's forced end-of-thinking at a token budget, see
-[docs/results.md](docs/results.md)). DFlash2 is still ahead on public prose,
+[docs/results.md](docs/results.md)). The reference drafter is still ahead on public prose,
 code and structured output; v81 is ahead on agentic coding traffic like the
 traffic it was trained on.
 
 Versions: v79 (2026-10-31, fresh agentic sessions), v80 (2026-11-01,
 served-path objective), v81 (2026-11-05, one epoch over 76K rows / 119M stored
-tokens). Since round 2b (0.73-0.76x of DFlash2's tok/step on matched prose and
+tokens). Since round 2b (0.73-0.76x of the reference drafter's tok/step on matched prose and
 code, 0.65x on RigMark structured), v81 is at 0.85x, 0.84x and 0.88x. Every
 version descends from the same fresh initialization. Per-round data, curves
 and caveats: [docs/results.md](docs/results.md).
