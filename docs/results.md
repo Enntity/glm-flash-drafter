@@ -1,10 +1,13 @@
 # Results
 
+"Reference" is the reference drafter defined in the [README](../README.md), the
+best public DFlash2 drafter for GLM-5.3-Flash.
+
 All runs on two GB10 nodes (one GPU each, 200G RoCE). Atlas measurements use
 the same engine image, profile and settings for every drafter (two-node
 tensor/expert parallel GLM-5.3-Flash NVFP4, greedy, one request at a time,
 copy drafts on as in production); arms differ only in `--draft-model`. Visits
-ran in ABBA order (scratch, DFlash2, DFlash2, scratch), and both visits of an
+ran in ABBA order (scratch, reference, reference, scratch), and both visits of an
 arm gave identical tok/step. Rounds 1-2b are single training runs.
 
 ## Rounds 3-4: v79 to v81 (current)
@@ -27,7 +30,7 @@ more than more turns of known ones.
 What round 4 settled before v81: selector edge weight (0.6 vs 1.0), `ce` vs
 `nla` unary loss and their mix all measured the same; short A/Bs started from
 an annealed checkpoint cannot rank recipes, because the re-warm swamps the
-difference. An overfit probe fits seen held-out rows past DFlash2 within 100
+difference. An overfit probe fits seen held-out rows past the reference within 100
 steps, so the wall is generalization, not capacity: the lever is more and more
 varied teacher text. A 1% data increase moved nothing live; v81's full
 one-epoch pass over the grown pool did.
@@ -70,11 +73,11 @@ Held-out `eal` (teacher-forced expected accepted length per 8-token block):
 
 ### v81 in Atlas (2026-11-05)
 
-Same harness as below. Public probes: v81 and v80 two visits each, DFlash2
-one; tok/step was identical between an arm's visits. Held-out agentic turns:
+Same harness as below. Public probes: v81 and v80 two visits each, the
+reference one; tok/step was identical between an arm's visits. Held-out agentic turns:
 one visit per arm. Engine decode tok/s, tok/step in brackets:
 
-| category | v81 | v80 | DFlash2 | v81 / DFlash2 tok/s |
+| category | v81 | v80 | reference | v81 / reference tok/s |
 |---|---|---|---|---|
 | matched prose | 40.9 (2.12) | 40.1 (2.06) | 46.8 (2.50) | 87% |
 | matched code | 63.0 (4.11) | 61.5 (3.99) | 69.2 (4.89) | 91% |
@@ -87,7 +90,7 @@ one visit per arm. Engine decode tok/s, tok/step in brackets:
 
 Survival by draft depth (share of verify steps accepting at least d drafts):
 
-| category | v81 | DFlash2 |
+| category | v81 | reference |
 |---|---|---|
 | prose | .68 .35 .07 .02 .00 .00 .00 | .74 .46 .18 .07 .02 .01 .00 |
 | code | .87 .71 .50 .37 .25 .16 .11 | .90 .78 .60 .51 .42 .33 .25 |
@@ -114,7 +117,7 @@ published; see the README for what that means for reproduction.
 
 ## Atlas: accepted tokens per verify step
 
-| category | DFlash2 (incoai) | round 1 | round 2a | 2a / DFlash2 |
+| category | reference | round 1 | round 2a | 2a / reference |
 |---|---|---|---|---|
 | matched prose, 12 prompts x 256 forced tokens | 2.501 | 1.589 | 1.785 | 0.71 |
 | matched code, 12 prompts x 256 forced tokens | 4.890 | 2.471 | 2.863 | 0.59 |
@@ -124,7 +127,7 @@ published; see the README for what that means for reproduction.
 
 Decode tok/s (engine per-request rate, mean of 2 visits):
 
-| category | DFlash2 | round 1 | round 2a |
+| category | reference | round 1 | round 2a |
 |---|---|---|---|
 | matched prose | 45.8 | 31.1 | 34.9 |
 | matched code | 69.4 | 44.8 | 49.5 |
@@ -132,21 +135,21 @@ Decode tok/s (engine per-request rate, mean of 2 visits):
 | RigMark prose | 39.5 | 27.2 | 31.0 |
 | RigMark structured | 90.7 | 38.6 | 43.0 |
 
-DFlash2's matched prose / code tok/step (2.501 / 4.890) reproduce its earlier
-reference measurements (2.501 / 4.881) on the same harness. RigMark rows use
+The reference drafter's matched prose / code tok/step (2.501 / 4.890) reproduce
+its earlier measurements (2.501 / 4.881) on the same harness. RigMark rows use
 thinking on, low effort.
 
 Engine per-position survival (share of verify steps accepting at least d
 drafts, weighted by steps):
 
-| category | DFlash2 | round 1 | round 2a |
+| category | reference | round 1 | round 2a |
 |---|---|---|---|
 | prose | .74 .46 .18 .07 .02 .01 .00 | .46 .13 .00 .00 .00 .00 .00 | .55 .21 .02 .00 .00 .00 .00 |
 | code | .90 .78 .60 .51 .42 .33 .25 | .71 .43 .18 .08 .03 .01 .00 | .80 .55 .25 .14 .06 .02 .01 |
 | RigMark structured | 1.0 .95 .95 .95 .93 .90 .90 | .78 .30 .00 .00 .00 .00 .00 | .83 .54 .04 .00 .00 .00 .00 |
 
 The drop to near zero at depth 3 is mostly Atlas's confidence-based verify
-width (calibrated on DFlash2's confidences) cutting short verifies, which the
+width (calibrated on the reference drafter's confidences) cutting short verifies, which the
 engine then counts as rejected: the trainer's proxy for the same categories
 shows a gradual decline (template prose .58 .28 .12). A fixed-width visit
 (`ATLAS_DFLASH_FIXED_WIDTH=7`) is the check; not run yet.
@@ -214,7 +217,7 @@ by the parent rounds (about a quarter of their anchor positions), so its
 step-0 value is optimistic; round 2b never trains on them.
 
 Atlas tok/step (shipped adaptive verify width): matched prose 1.905, matched
-code 3.574, RigMark structured 4.944 (0.76x, 0.73x and 0.65x of DFlash2);
+code 3.574, RigMark structured 4.944 (0.76x, 0.73x and 0.65x of the reference);
 RigMark structured decode rose from 43 to 71 tok/s. A fixed verify width of 7
 raised tok/step 5-18% but lowered decode speed 3-34%, so the adaptive policy
 is the right one for this drafter. Prose survival by draft depth is

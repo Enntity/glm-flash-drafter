@@ -5,7 +5,7 @@ What is built is marked **done**; everything else is a plan and may change.
 ## 1. Check every release in Atlas
 
 **done**: rounds 2b to 4 were checked in Atlas for exactness and tok/s against
-the previous version and DFlash2 (fixed-width visit included for round 2b).
+the previous version and the reference drafter (fixed-width visit included for round 2b).
 v81 is the current version; see [results.md](results.md).
 
 ## 2. Data scaling
