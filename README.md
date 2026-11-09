@@ -57,7 +57,7 @@ target's hidden states at layers 5, 14, 24, 33 and 42, proposing 7 tokens per
 step. 1.17B trained parameters; the embedding and lm_head are the target's,
 frozen.
 
-Atlas decode speed on SparkGLM (two GB10 nodes, NVFP4 target, greedy, one
+Atlas decode speed on a two-node GB10 server (NVFP4 target, greedy, one
 request at a time, shipped adaptive verify width; every arm on the same server
 and settings, differing only in `--draft-model`; 2026-11-05). Engine tok/s,
 accepted tokens per verify step in brackets:
@@ -80,11 +80,12 @@ one difference is the engine's forced end-of-thinking at a token budget, see
 code and structured output; v81 is ahead on agentic coding traffic like the
 traffic it was trained on.
 
-Since round 2b (0.73-0.76x of DFlash2's tok/step on matched prose and code,
-0.65x on RigMark structured), rounds 3 and 4 added fresh agentic sessions,
-prose and code coverage and a served-path objective; v81 is at 0.85x, 0.84x
-and 0.88x. Per-round data, curves and caveats:
-[docs/results.md](docs/results.md).
+Versions: v79 (2026-10-31, fresh agentic sessions), v80 (2026-11-01,
+served-path objective), v81 (2026-11-05, one epoch over 76K rows / 119M stored
+tokens). Since round 2b (0.73-0.76x of DFlash2's tok/step on matched prose and
+code, 0.65x on RigMark structured), v81 is at 0.85x, 0.84x and 0.88x. Every
+version descends from the same fresh initialization. Per-round data, curves
+and caveats: [docs/results.md](docs/results.md).
 
 ## Pipeline
 
@@ -93,7 +94,8 @@ and 0.88x. Per-round data, curves and caveats:
 2. **Teacher text** (`scripts/api_generate.py`): GLM-5.3-Flash completions from
    hosted endpoints (OpenRouter, `data_collection: deny`, Z.AI's endpoint
    excluded by its terms), thinking mode, temperature 1.0 / top_p 0.95 like
-   serving.
+   serving. Later rounds add GLM-5.3-Flash coding-agent sessions on
+   Enntity-authored tasks, where every answer and tool call is GLM's own.
 3. **Hidden-state capture** (`scripts/prepare_items.py`, `scripts/capture.py`):
    each prompt + completion is prefilled once by the target in Atlas with the
    capture patch (branch
@@ -102,9 +104,12 @@ and 0.88x. Per-round data, curves and caveats:
 4. **FP8 shards** (`python -m enntity_drafter.fp8`): e4m3 with one scale per
    row per slot, 24,600 bytes per token, 2.6% relative L2, teacher top-1
    unchanged on 98.9% of positions.
-5. **Training** (`scripts/train.py`): from-scratch init, upstream DFlash2
-   objective (KL to the target distribution + selector cross-entropy),
-   data-parallel across nodes, deterministic resume.
+5. **Training** (`scripts/train.py`): from-scratch init (round 1), then each
+   round continues from the last global. Rounds 1-3 used the upstream DFlash2
+   objective (KL to the target distribution + selector cross-entropy); v80 and
+   v81 use `selector_prefix` (each slot weighted by the chance the served path
+   reaches it, plus an expected-accepted-length term) with `nla` unary loss.
+   Two-node plain averaging (DiLoCo, outer lr 1), deterministic resume.
 6. **Export** (`scripts/export.py` or `--export`): the 81-tensor BF16 layout
    Atlas loads with `--draft-model`; config generated from our own config.
 7. **Atlas check** (`scripts/atlas_check.py`): exactness and tok/step per
@@ -151,9 +156,9 @@ More: [docs/pipeline.md](docs/pipeline.md), [docs/capture.md](docs/capture.md)
   builders (especially prose, where the drafter is weakest) are the most useful code contribution today.
 - **Run capture and training locally**, on one or two GB10-class machines with your own GLM-5.3-Flash copy. The
   CPU tests exercise the full trainer, the coordinator and the validator on a tiny model with no GPU.
-- **Reproduce results.** The Atlas check and the trainer's held-out evals are scripted. Rounds 1-2b also used
-  Enntity-internal agentic and chat traffic, which is not published, so those exact runs cannot be repeated from
-  this repo alone; runs on the public builders can, and we will publish theirs.
+- **Reproduce results.** The Atlas check and the trainer's held-out evals are scripted. Every round so far,
+  v81 included, also used Enntity-internal agentic and chat traffic, which is not published, so those exact runs
+  cannot be repeated from this repo alone; runs on the public builders can, and we will publish theirs.
 
 No data is ever uploaded to the network: recipe sites generate Enntity shard recipes locally, and
 bring-your-own-data sites keep their data. See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
