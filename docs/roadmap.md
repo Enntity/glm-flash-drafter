@@ -68,8 +68,8 @@ tok/step against the previous one before it is published.
 
 ## 6. Weights
 
-v79, v80 and v81 are signed network globals; SparkGLM currently ships v80. The inference weights are not public yet. A public release would
-come with the data card, training command, provenance stamp and Atlas
-receipts; weights trained on the internal sources need a decision about those
-sources first, and public-only data rounds remain the path to a fully
-reproducible release.
+**done**: v80 and v81 are public on Hugging Face at
+[Enntity/GLM-5.3-Flash-DFlash2-enntity](https://huggingface.co/Enntity/GLM-5.3-Flash-DFlash2-enntity)
+(Apache-2.0, one tag per release, provenance stamp and Atlas results on the
+card); SparkGLM currently ships v80. Public-only data rounds remain the path to
+a fully reproducible release.

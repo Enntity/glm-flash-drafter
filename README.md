@@ -16,10 +16,19 @@ check and extend.
 
 Status: **research; outside contributors welcome.** The current version is
 **v81** (2026-11-05): 87-95% of the reference drafter's decode speed on public prompts and
-115-122% on held-out coding-agent turns. SparkGLM currently ships v80; the
-inference weights are not public yet. Signed training globals are available to
-registered compute sites. Everything here is measured on Enntity's own
-two-node GB10 setup; numbers are from single runs unless stated.
+115-122% on held-out coding-agent turns. Weights:
+[Enntity/GLM-5.3-Flash-DFlash2-enntity](https://huggingface.co/Enntity/GLM-5.3-Flash-DFlash2-enntity)
+(Apache-2.0, one tag per release). SparkGLM currently ships v80. Signed training
+globals are available to registered compute sites. Everything here is measured
+on Enntity's own two-node GB10 setup; numbers are from single runs unless
+stated.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/rigmark-progress-dark.svg">
+  <img alt="RigMark decode tok/s from no drafter (about 28, estimated) through rounds 1, 2a, 2b, v79, v80 and v81 (structured 84.2, code 63.3, prose 36.0), against the reference drafter (91.0, 66.9, 39.0)" src="docs/img/rigmark-progress-light.svg">
+</picture>
+
+Regenerate with `python scripts/rigmark_progress_chart.py docs/img`.
 
 ## Why
 
