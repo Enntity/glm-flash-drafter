@@ -27,7 +27,7 @@ project pages; check them for the current paper versions.
   convolutions, and a candidate selector that re-ranks the unary top-k using
   the previous token. We use the architecture and code only.
 - **incoai/GLM-5.3-Flash-DFlash2.** https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2,
-  CC BY-NC-ND 4.0. The reference drafter in our measurements. None of its
+  Apache-2.0 since 2026-11-10 (CC BY-NC-ND 4.0 before). The reference drafter in our measurements. None of its
   weights, configuration, tokenizer files or text are used; the guard refuses
   them.
 

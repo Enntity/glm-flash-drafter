@@ -36,7 +36,8 @@ A drafter proposes several tokens per step and the target model verifies them
 in one pass; the output is the target's own (greedy verification). How much
 faster decoding gets depends on how many drafted tokens the target accepts.
 
-The reference drafter is licensed CC BY-NC-ND 4.0: no commercial use, no derivatives. The method and
+The reference drafter was licensed CC BY-NC-ND 4.0 (no commercial use, no derivatives) when this
+project started; its publisher relicensed it under Apache-2.0 on 2026-11-10. The method and
 the code are open (DFlash/DFlash2 code is MIT and Apache-2.0, see
 [docs/prior-art.md](docs/prior-art.md)), and the target model is MIT. Training
 new weights from a fresh initialization, on data we are allowed to use, gives
